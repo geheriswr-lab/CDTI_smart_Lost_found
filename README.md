@@ -21,16 +21,16 @@
 
 **เป้าหมาย:** วางรากฐานระบบทั้งหมดให้ปลอดภัยตั้งแต่ระดับ Database
 
-- [ ] ออกแบบ ER Diagram ของทุกตารางหลัก:
+- [x] ออกแบบ ER Diagram ของทุกตารางหลัก:
   `profiles`, `categories`, `locations`, `handover_locations`, `lost_items`, `found_items`,
   `matches`, `claims`, `claim_evidence`, `notifications`, `risk_events`, `audit_logs`,
   `custody_history`, `internal_notes`, `handover_codes`
-- [ ] สร้าง Enums: item status, claim status, risk level, custody status ฯลฯ
-- [ ] เขียน Supabase Migrations แยกตามตาราง
-- [ ] เขียน `supabase/setup_all.sql` สำหรับ setup ใหม่ทั้งระบบ (idempotent เท่าที่เหมาะสม)
-- [ ] เปิดใช้ RLS ทุกตารางตั้งแต่ต้น (default deny)
-- [ ] ออกแบบ Public Database View (`public_lost_items`, `public_found_items`) ที่ไม่มี private columns ตั้งแต่ระดับ DB
-- [ ] แยก Storage Bucket: public item images / private verification evidence
+- [x] สร้าง Enums: item status, claim status, risk level, custody status ฯลฯ
+- [x] เขียน Supabase Migrations แยกตามตาราง
+- [x] เขียน `supabase/setup_all.sql` สำหรับ setup ใหม่ทั้งระบบ (idempotent เท่าที่เหมาะสม)
+- [x] เปิดใช้ RLS ทุกตารางตั้งแต่ต้น (default deny)
+- [x] ออกแบบ Public Database View (`public_lost_items`, `public_found_items`) ที่ไม่มี private columns ตั้งแต่ระดับ DB
+- [x] แยก Storage Bucket: public item images / private verification evidence
 
 **Deliverable:** Database พร้อม RLS ใช้งานได้ ยังไม่มี UI
 

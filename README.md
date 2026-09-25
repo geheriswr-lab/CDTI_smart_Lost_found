@@ -40,16 +40,16 @@
 
 **เป้าหมาย:** ระบบล็อกอินและสิทธิ์การเข้าถึงที่ปลอดภัย
 
-- [ ] ตั้งค่า Supabase Auth (email/password)
-- [ ] ตาราง `profiles`: user_type (vocational_student, university_student, teacher_staff, royal_household_staff, external_visitor) + system role (user, staff, admin)
-- [ ] Session management + protected routes
-- [ ] Server-side authorization (ไม่เชื่อ permission จาก client)
-- [ ] Email verification (ถ้าเหมาะสม)
-- [ ] สร้าง Initial Admin Account ผ่าน Supabase Auth (`admin@cdti.ac.th`)
-  - [ ] `must_change_password = true` สำหรับบัญชีเริ่มต้น
-  - [ ] บังคับเปลี่ยนรหัสผ่านหลัง login ครั้งแรก
-  - [ ] ตรวจสิทธิ์ admin จาก `role` ใน DB เท่านั้น (ห้ามเช็ค email)
-- [ ] Guest browsing (ไม่ login) เข้าดู Public Listing ได้
+- [x] ตั้งค่า Supabase Auth (email/password)
+- [x] ตาราง `profiles`: user_type (vocational_student, university_student, teacher_staff, royal_household_staff, external_visitor) + system role (user, staff, admin)
+- [x] Session management + protected routes
+- [x] Server-side authorization (ไม่เชื่อ permission จาก client)
+- [x] Email verification (ถ้าเหมาะสม)
+- [x] สร้าง Initial Admin Account ผ่าน Supabase Auth (`admin@cdti.ac.th`)
+  - [x] `must_change_password = true` สำหรับบัญชีเริ่มต้น
+  - [x] บังคับเปลี่ยนรหัสผ่านหลัง login ครั้งแรก
+  - [x] ตรวจสิทธิ์ admin จาก `role` ใน DB เท่านั้น (ห้ามเช็ค email)
+- [x] Guest browsing (ไม่ login) เข้าดู Public Listing ได้
 
 **Deliverable:** Login / Signup / Role-based routing ใช้งานได้จริง
 

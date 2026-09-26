@@ -17,6 +17,7 @@ function targetHref(type: string, payload: Record<string, unknown>): string | nu
   }
   if (type === "dispute_review_required") return "/admin/claims?tab=disputed";
   if (type === "case_escalated") return "/admin/escalations";
+  if (type === "reward_offered" || type === "reward_settled" || type === "perk_voucher") return "/dashboard/rewards";
   if (type === "item_returned") {
     const fid = payload.found_item_id;
     return typeof fid === "string" && UUID_RE.test(fid) ? `/dashboard/found/${fid}` : null;
@@ -24,6 +25,7 @@ function targetHref(type: string, payload: Record<string, unknown>): string | nu
   const claimId = payload.claim_id;
   if (typeof claimId !== "string" || !UUID_RE.test(claimId)) return null;
   if (type === "claim_review_required") return `/admin/claims/${claimId}`;
+  if (type === "reward_payable") return `/claims/${claimId}#thanks`;
   if (type.startsWith("claim_") || type.startsWith("handover_")) return `/claims/${claimId}`;
   return null;
 }

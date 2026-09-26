@@ -6,8 +6,8 @@
 /** Auth-flow routes reachable while logged out or while a password change is pending. */
 const ALWAYS_ALLOWED = ["/login", "/signup", "/forgot-password", "/auth", "/change-password", "/api/health"];
 
-/** Guest browsing: home, public listings and public detail pages only. */
-const PUBLIC_ROUTE = /^\/(?:(?:lost|found)(?:\/[^/]+)?)?\/?$/;
+/** Guest browsing: home, public listings/detail pages, SE impact + sponsors. */
+const PUBLIC_ROUTE = /^\/(?:(?:lost|found)(?:\/[^/]+)?|impact|sponsors)?\/?$/;
 
 function underPrefix(pathname: string, prefix: string) {
   return pathname === prefix || pathname.startsWith(prefix + "/");

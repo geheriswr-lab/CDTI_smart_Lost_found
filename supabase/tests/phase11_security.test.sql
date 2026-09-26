@@ -114,7 +114,8 @@ begin
   from information_schema.role_table_grants
   where grantee = 'anon' and table_schema = 'public'
     and not (privilege_type = 'SELECT' and table_name in
-             ('categories','locations','handover_locations','public_lost_items','public_found_items'));
+             ('categories','locations','handover_locations','public_lost_items','public_found_items',
+              'platform_settings','public_partners','public_impact'));
   if bad is not null then raise exception 'FAIL: anon has table privileges: %', bad; end if;
 
   -- authenticated must have no access at all to the secret tables.
@@ -128,7 +129,8 @@ begin
   from information_schema.role_table_grants
   where grantee = 'authenticated' and table_schema = 'public'
     and privilege_type in ('INSERT','UPDATE','DELETE','TRUNCATE')
-    and table_name in ('claims','claim_reviews','risk_events','audit_logs','handovers','custody_history','case_escalations','matches')
+    and table_name in ('claims','claim_reviews','risk_events','audit_logs','handovers','custody_history','case_escalations','matches',
+                       'rewards','perk_vouchers','funding_records','platform_settings')
     or (grantee = 'authenticated' and table_schema = 'public' and table_name = 'notifications'
         and privilege_type in ('INSERT','DELETE','TRUNCATE'));
   if bad is not null then raise exception 'FAIL: authenticated can write server-owned tables: %', bad; end if;

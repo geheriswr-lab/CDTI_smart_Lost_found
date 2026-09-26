@@ -8,6 +8,8 @@ const LINKS: { href: string; label: string; adminOnly?: boolean }[] = [
   { href: "/admin/custody", label: "การครอบครอง" },
   { href: "/admin/handovers", label: "ส่งมอบ" },
   { href: "/admin/stats", label: "สถิติ" },
+  { href: "/admin/se", label: "SE / รายได้" },
+  { href: "/admin/partners", label: "ผู้สนับสนุน" },
   { href: "/admin/audit", label: "Audit log" },
   { href: "/admin/categories", label: "ประเภท" },
   { href: "/admin/locations", label: "สถานที่" },

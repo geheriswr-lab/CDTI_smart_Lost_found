@@ -7,6 +7,9 @@ import { CLAIMANT_STATUS } from "@/lib/claims/labels";
 import { labelledAnswers } from "@/lib/claims/questionnaire";
 import { formatThaiDateTime } from "@/lib/reports/labels";
 import { HandoverCodePanel } from "./handover-panel";
+import { OfferRewardForm, PayDemoForm } from "@/components/se/se-forms";
+import { getPlatformSettings } from "@/lib/se/queries";
+import { REWARD_NAME, REWARD_STATUS_OWNER, feeFor, formatBaht } from "@/lib/se/labels";
 
 export const metadata = { title: "คำขอรับของ — CDTI Smart Lost & Found" };
 
@@ -51,6 +54,11 @@ export default async function MyClaimPage({
   const { data: handoverRows } =
     claim.status === "approved" ? await supabase.rpc("my_handover_info", { p_claim_id: claim.id }) : { data: null };
   const handover = handoverRows?.[0] ?? null;
+  const returned = claim.status === "approved" && !!handover?.completed;
+  const [settings, { data: myRewards }] = returned
+    ? await Promise.all([getPlatformSettings(), supabase.rpc("my_rewards")])
+    : [null, { data: null }];
+  const reward = (myRewards ?? []).find((r) => r.my_role === "owner" && r.claim_id === claim.id && r.status !== "cancelled") ?? null;
   const canCancel = ["pending", "needs_review", "insufficient"].includes(claim.status);
   const canResubmit =
     (claim.status === "insufficient" || claim.status === "cancelled") && claim.claim_attempt_count < 3;
@@ -119,6 +127,37 @@ export default async function MyClaimPage({
         {status.tone === "info" && <p>เจ้าหน้าที่กำลังตรวจสอบ ระบบจะแจ้งให้ทราบเมื่อมีผล</p>}
         {claim.status === "cancelled" && <p>คุณยกเลิกคำขอนี้แล้ว</p>}
       </section>
+
+      {returned && settings && (
+        <section id="thanks" className="rounded-lg border border-green-100 bg-white p-5 text-sm shadow-sm">
+          <h2 className="font-semibold text-cdti-700">{REWARD_NAME}</h2>
+          {reward ? (
+            <div className="mt-2 space-y-2">
+              <p>
+                {formatBaht(reward.amount)} — {REWARD_STATUS_OWNER[reward.status]}
+              </p>
+              {reward.fee_amount !== null && (
+                <p className="text-xs text-gray-500">
+                  ผู้พบได้รับ {formatBaht(reward.finder_amount)} · ค่าดำเนินการระบบ {formatBaht(reward.fee_amount)}
+                  {reward.payment_ref && ` · เลขอ้างอิง ${reward.payment_ref}`}
+                </p>
+              )}
+              {reward.status === "payable" && <PayDemoForm rewardId={reward.id} returnTo={`/claims/${claim.id}`} />}
+            </div>
+          ) : (
+            <div className="mt-2 space-y-2">
+              <p className="text-xs text-gray-500">
+                หากต้องการขอบคุณผู้ที่ช่วยส่งคืน สามารถมอบสินน้ำใจได้ตามความสมัครใจภายใน {settings.reward_offer_days} วัน —
+                ไม่ให้ก็ได้ ไม่มีผลใด ๆ กับคุณ
+              </p>
+              <OfferRewardForm claimId={claim.id} settings={settings} />
+              <p className="text-xs text-gray-400">
+                ตัวอย่าง: 300 บาท → ผู้พบได้รับ {formatBaht(feeFor(300, settings.reward_fee_percent, settings.reward_fee_min).finder)}
+              </p>
+            </div>
+          )}
+        </section>
+      )}
 
       <section className="rounded-lg bg-white p-5 shadow-sm">
         <h2 className="text-sm font-semibold text-cdti-700">คำตอบของคุณ (ครั้งล่าสุด)</h2>

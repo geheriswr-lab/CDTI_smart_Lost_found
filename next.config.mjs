@@ -12,6 +12,10 @@ try {
 }
 const supabaseWs = supabaseOrigin.replace(/^http/, "ws");
 const isDev = process.env.NODE_ENV !== "production";
+// Force-https rules only when the site is actually served over https (Vercel,
+// a tunnel, a real domain). Running `npm start` on http://<LAN-IP>:3000 for a
+// local demo must not tell browsers to upgrade to https (the page would break).
+const httpsSite = !!process.env.VERCEL || (process.env.NEXT_PUBLIC_SITE_URL ?? "").startsWith("https://");
 
 const csp = [
   "default-src 'self'",
@@ -25,7 +29,7 @@ const csp = [
   "object-src 'none'",
   "base-uri 'self'",
   "form-action 'self'",
-  ...(isDev ? [] : ["upgrade-insecure-requests"]),
+  ...(!isDev && httpsSite ? ["upgrade-insecure-requests"] : []),
 ].join("; ");
 
 export const securityHeaders = [
@@ -34,8 +38,8 @@ export const securityHeaders = [
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
-  { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains" },
-  { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+  ...(httpsSite ? [{ key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains" }] : []),
+  ...(httpsSite ? [{ key: "Cross-Origin-Opener-Policy", value: "same-origin" }] : []),
 ];
 
 /** @type {import('next').NextConfig} */

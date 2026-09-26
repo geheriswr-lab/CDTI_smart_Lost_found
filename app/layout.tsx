@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { Nav } from "@/components/nav";
 import { getCurrentProfile } from "@/lib/auth/session";
 import { createClient } from "@/lib/supabase/server";
@@ -34,6 +35,11 @@ export default async function RootLayout({
       <body className="min-h-screen bg-cdti-50 text-gray-900 antialiased">
         <Nav profile={profile} unreadCount={unreadCount} />
         <main className="mx-auto max-w-5xl px-4 py-8">{children}</main>
+        <footer className="mx-auto flex max-w-5xl flex-wrap gap-x-4 gap-y-1 px-4 pb-8 text-xs text-gray-500">
+          <span>CDTI Smart Lost &amp; Found — บริการคืนของฟรีเสมอ</span>
+          <Link href="/impact" className="hover:text-cdti-600">ผลลัพธ์ทางสังคม</Link>
+          <Link href="/sponsors" className="hover:text-cdti-600">ผู้สนับสนุนโครงการ</Link>
+        </footer>
       </body>
     </html>
   );

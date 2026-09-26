@@ -9,10 +9,10 @@ const pendingAdmin: RouteProfile = { ...admin, must_change_password: true };
 const restrictedStaff: RouteProfile = { ...staff, is_restricted: true };
 
 test("public routes are exact: listings and detail pages only", () => {
-  for (const p of ["/", "/lost", "/found", "/lost/abc", "/found/0b8c1f9e-1111-4222-8333-444455556666", "/found/"]) {
+  for (const p of ["/", "/lost", "/found", "/impact", "/sponsors", "/lost/abc", "/found/0b8c1f9e-1111-4222-8333-444455556666", "/found/"]) {
     assert.equal(isPublicRoute(p), true, p);
   }
-  for (const p of ["/found/x/claim", "/lost/x/edit", "/lostfound", "/foundx", "/admin", "/dashboard", "/claims/1", "/found//claim"]) {
+  for (const p of ["/found/x/claim", "/lost/x/edit", "/lostfound", "/foundx", "/admin", "/dashboard", "/claims/1", "/found//claim", "/impact/x", "/sponsorsx"]) {
     assert.equal(isPublicRoute(p), false, p);
   }
 });

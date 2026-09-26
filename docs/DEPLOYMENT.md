@@ -28,10 +28,11 @@ npm run security:secrets     # ไม่มีรหัสผ่าน/คีย
 
 1. New project → Region **Southeast Asia (Singapore)** (ใกล้ผู้ใช้ และตรงกับ Vercel region `sin1` ใน `vercel.json`)
 2. **[ตัดสินใจ]** แผน: Free plan จะ **pause project เมื่อไม่มีการใช้งาน 7 วัน** และไม่มี backup ให้ดาวน์โหลด → ใช้งานจริงควรใช้ **Pro** (มี daily backup) และพิจารณาเปิด Point-in-Time Recovery
-3. SQL Editor → เปิดไฟล์ `supabase/setup_all.sql` → Run (ไฟล์เดียวรวมทุก migration 0001–0027)
+3. SQL Editor → เปิดไฟล์ `supabase/setup_all.sql` → Run (ไฟล์เดียวรวมทุก migration 0001–0028)
 4. รันตัวตรวจ (ทุกแถวต้องเป็น ✅):
    - `supabase/verify/0026_verify.sql` (15 แถว)
    - `supabase/verify/0027_verify.sql` (4 แถว)
+   - `supabase/verify/0028_verify.sql` (8 แถว)
    - `supabase/verify/security_selftest.sql` (22 แถว — ทดลองโจมตีแล้ว rollback ไม่ทิ้งข้อมูล)
 
 ## 3. ตั้งค่า Authentication (Supabase Dashboard)

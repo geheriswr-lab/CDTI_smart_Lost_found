@@ -324,6 +324,112 @@ export type AuditLog = {
   created_at: string;
 };
 
+// ---------------------------------------------------------------------------
+// Phase 13 — Social Enterprise (0028)
+// ---------------------------------------------------------------------------
+import type { FundingKind, PlatformSettings, RewardStatus, FinderChoice } from "@/lib/se/labels";
+
+export type Reward = {
+  id: string;
+  owner_id: string;
+  lost_item_id: string | null;
+  claim_id: string | null;
+  finder_id: string | null;
+  amount: number;
+  fee_percent: number | null;
+  fee_amount: number | null;
+  finder_amount: number | null;
+  status: RewardStatus;
+  finder_choice: FinderChoice | null;
+  payment_ref: string | null;
+  cancel_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  payable_at: string | null;
+  paid_at: string | null;
+  settled_at: string | null;
+};
+
+export type MyReward = {
+  id: string;
+  my_role: "owner" | "finder";
+  item_name: string | null;
+  claim_id: string | null;
+  lost_item_id: string | null;
+  amount: number;
+  fee_amount: number | null;
+  finder_amount: number | null;
+  status: RewardStatus;
+  finder_choice: FinderChoice | null;
+  payment_ref: string | null;
+  created_at: string;
+  payable_at: string | null;
+};
+
+export type Partner = {
+  id: string;
+  name: string;
+  description: string | null;
+  website: string | null;
+  internal_note: string | null;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type PartnerPerk = {
+  id: string;
+  partner_id: string;
+  name: string;
+  description: string | null;
+  quota: number | null;
+  issued_count: number;
+  valid_days: number;
+  is_active: boolean;
+  created_at: string;
+};
+
+export type PerkVoucher = {
+  id: string;
+  perk_id: string;
+  finder_id: string;
+  claim_id: string;
+  code: string;
+  status: "issued" | "redeemed" | "revoked";
+  issued_at: string;
+  expires_at: string;
+  redeemed_at: string | null;
+  redeemed_by: string | null;
+};
+
+export type FundingRecord = {
+  id: string;
+  kind: FundingKind;
+  source_name: string;
+  partner_id: string | null;
+  amount: number;
+  period_start: string | null;
+  period_end: string | null;
+  received_on: string;
+  note: string | null;
+  is_void: boolean;
+  void_reason: string | null;
+  created_by: string | null;
+  created_at: string;
+};
+
+export type PublicPartner = { id: string; name: string; description: string | null; website: string | null; perks: string[] };
+
+export type PublicImpact = {
+  items_returned: number;
+  items_returned_30d: number;
+  thank_yous: number;
+  thank_you_to_finders: number;
+  donated_by_finders: number;
+  perks_given: number;
+  active_partners: number;
+  reward_fee_percent: number;
+};
+
 type Table<Row, Insert> = {
   Row: Row;
   Insert: Insert;
@@ -367,9 +473,17 @@ export type Database = {
       internal_notes: Table<InternalNote, Pick<InternalNote, "entity_type" | "entity_id" | "author_id" | "note">>;
       case_escalations: Table<CaseEscalation, never>;
       custody_history: Table<CustodyHistory, never>;
+      platform_settings: Table<PlatformSettings, never>;
+      rewards: Table<Reward, never>;
+      partners: Table<Partner, Pick<Partner, "name"> & Partial<Omit<Partner, "id" | "created_at">>>;
+      partner_perks: Table<PartnerPerk, Pick<PartnerPerk, "partner_id" | "name"> & Partial<Omit<PartnerPerk, "id" | "created_at" | "issued_count">>>;
+      perk_vouchers: Table<PerkVoucher, never>;
+      funding_records: Table<FundingRecord, never>;
       audit_logs: Table<AuditLog, Pick<AuditLog, "action" | "entity_type"> & Partial<Omit<AuditLog, "id" | "created_at">>>;
     };
     Views: {
+      public_partners: { Row: PublicPartner; Relationships: [] };
+      public_impact: { Row: PublicImpact; Relationships: [] };
       public_lost_items: {
         Row: PublicLostItem;
         Relationships: [];
@@ -439,6 +553,40 @@ export type Database = {
         Args: { p_event_id: string; p_resolution: "needs_review" | "suspicious_activity" | "cleared"; p_note?: string | null };
         Returns: undefined;
       };
+      pledge_reward: { Args: { p_lost_item_id: string; p_amount: number }; Returns: string };
+      cancel_reward_pledge: { Args: { p_reward_id: string }; Returns: undefined };
+      offer_reward_after_return: { Args: { p_claim_id: string; p_amount: number }; Returns: string };
+      pay_reward_demo: { Args: { p_reward_id: string }; Returns: string };
+      set_reward_choice: { Args: { p_reward_id: string; p_choice: FinderChoice }; Returns: undefined };
+      settle_reward: { Args: { p_reward_id: string }; Returns: string };
+      cancel_reward_admin: { Args: { p_reward_id: string; p_reason: string }; Returns: undefined };
+      my_rewards: { Args: Record<string, never>; Returns: MyReward[] };
+      redeem_perk_voucher: { Args: { p_code: string }; Returns: string };
+      revoke_perk_voucher: { Args: { p_voucher_id: string; p_reason: string }; Returns: undefined };
+      my_vouchers: {
+        Args: Record<string, never>;
+        Returns: {
+          id: string; perk_name: string; perk_description: string | null; partner_name: string;
+          code: string; status: "issued" | "redeemed" | "revoked" | "expired"; issued_at: string; expires_at: string;
+        }[];
+      };
+      record_funding: {
+        Args: {
+          p_kind: FundingKind; p_source_name: string; p_amount: number; p_received_on: string;
+          p_period_start?: string | null; p_period_end?: string | null; p_partner_id?: string | null; p_note?: string | null;
+        };
+        Returns: string;
+      };
+      void_funding: { Args: { p_id: string; p_reason: string }; Returns: undefined };
+      update_platform_settings: {
+        Args: {
+          p_fee_percent: number; p_fee_min: number; p_reward_min: number; p_reward_max: number;
+          p_offer_days: number; p_vouchers_per_finder: number;
+        };
+        Returns: undefined;
+      };
+      se_summary: { Args: { p_from: string; p_to: string }; Returns: Record<string, unknown> };
+      reward_fee: { Args: { p_amount: number }; Returns: number };
       set_user_role: {
         Args: { p_user_id: string; p_role: SystemRole; p_reason: string };
         Returns: undefined;

@@ -31,6 +31,20 @@ export const AUDIT_ACTION_TH: Record<string, string> = {
   "case.escalated": "ส่งต่อเรื่องให้ admin",
   "case.escalation_resolved": "admin ปิดเรื่องที่ส่งต่อ",
   "user.role_set": "admin แต่งตั้ง/เปลี่ยนสิทธิ์ผู้ใช้",
+  "reward.pledged": "เจ้าของตั้งสินน้ำใจ",
+  "reward.pledge_cancelled": "เจ้าของยกเลิกสินน้ำใจ",
+  "reward.offered": "เจ้าของมอบสินน้ำใจหลังรับของ",
+  "reward.payable": "สินน้ำใจพร้อมมอบ (คืนของสำเร็จ)",
+  "reward.paid": "เจ้าของยืนยันการมอบสินน้ำใจ",
+  "reward.choice": "ผู้พบเลือกรับ/มอบให้โครงการ",
+  "reward.settled": "เจ้าหน้าที่บันทึกการโอน/บริจาค",
+  "reward.cancelled": "admin ยกเลิกสินน้ำใจ",
+  "voucher.issued": "ออกคูปองผู้สนับสนุน",
+  "voucher.redeemed": "ใช้คูปองผู้สนับสนุน",
+  "voucher.revoked": "ยกเลิกคูปอง",
+  "funding.recorded": "บันทึกรายได้โครงการ",
+  "funding.voided": "ยกเลิกรายการรายได้",
+  "settings.updated": "แก้ไขการตั้งค่า SE",
 };
 
 export const AUDIT_GROUPS: { key: string; label: string; prefixes: string[] }[] = [
@@ -38,6 +52,7 @@ export const AUDIT_GROUPS: { key: string; label: string; prefixes: string[] }[] 
   { key: "claims", label: "คำขอรับของ", prefixes: ["claim."] },
   { key: "custody", label: "การครอบครอง/ส่งมอบ", prefixes: ["custody.", "handover."] },
   { key: "risk", label: "สัญญาณความเสี่ยง", prefixes: ["risk."] },
+  { key: "se", label: "Social Enterprise", prefixes: ["reward.", "voucher.", "funding.", "settings."] },
   { key: "admin", label: "การกระทำของ admin", prefixes: ["account.", "profile.", "user.", "reference.", "internal_note.", "case."] },
 ];
 
@@ -52,6 +67,12 @@ export const ENTITY_TH: Record<string, string> = {
   locations: "สถานที่",
   handover_locations: "จุดส่งมอบ",
   escalation: "เรื่องส่งต่อ",
+  reward: "สินน้ำใจ",
+  partners: "ผู้สนับสนุน",
+  partner_perks: "สิทธิประโยชน์",
+  perk_voucher: "คูปอง",
+  funding: "รายได้โครงการ",
+  settings: "การตั้งค่า",
 };
 
 export const NOTIFICATION_TYPE_TH: Record<string, string> = {
@@ -69,12 +90,16 @@ export const NOTIFICATION_TYPE_TH: Record<string, string> = {
   account_unrestricted: "บัญชีใช้งานได้ปกติ",
   case_escalated: "เรื่องส่งต่อ (admin)",
   role_changed: "สิทธิ์การใช้งานเปลี่ยน",
+  reward_payable: "ยืนยันสินน้ำใจ",
+  reward_offered: "ได้รับสินน้ำใจ",
+  reward_settled: "โอนสินน้ำใจแล้ว",
+  perk_voucher: "สิทธิประโยชน์จากผู้สนับสนุน",
 };
 
 const SAFE_KEYS = new Set([
   "from", "to", "outcome", "from_status", "attempt", "issue", "score", "verification_level", "risk_level",
   "event_type", "resolution", "restricted", "must_change_password", "changed_fields", "id_checked", "name",
-  "is_active", "active_claims", "reason", "escalation_id", "has_public_image", "has_private_image", "custody_status",
+  "is_active", "active_claims", "reason", "amount", "fee", "choice", "kind", "mode", "fee_percent", "fee_min", "escalation_id", "has_public_image", "has_private_image", "custody_status",
 ]);
 
 /**

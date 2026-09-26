@@ -42,13 +42,13 @@ async function get(path, opts = {}) {
   const body = await r.json().catch(() => ({}));
   check("/api/health ตอบ ok (เชื่อมฐานข้อมูลได้)", r.status === 200 && body.status === "ok", `${r.status} ${JSON.stringify(body)}`);
 }
-for (const p of ["/", "/lost", "/found", "/login", "/signup"]) {
+for (const p of ["/", "/lost", "/found", "/login", "/signup", "/impact", "/sponsors"]) {
   const r = await get(p);
   check(`${p} เปิดได้ (200)`, r.status === 200, String(r.status));
 }
 
 // 2. Protected pages redirect guests to /login
-for (const p of ["/dashboard", "/admin", "/admin/claims", "/notifications", "/report/lost", "/found/00000000-0000-4000-8000-000000000000/claim"]) {
+for (const p of ["/dashboard", "/dashboard/rewards", "/admin", "/admin/claims", "/admin/se", "/notifications", "/report/lost", "/found/00000000-0000-4000-8000-000000000000/claim"]) {
   const r = await get(p);
   const loc = r.headers.get("location") ?? "";
   check(`${p} → ต้อง login`, r.status >= 300 && r.status < 400 && /\/login/.test(loc), `${r.status} ${loc}`);
@@ -100,7 +100,7 @@ if (!sbUrl || !anon) {
 } else {
   const H = { apikey: anon, Authorization: `Bearer ${anon}` };
   const rest = (p, init = {}) => fetch(`${sbUrl}/rest/v1${p}`, { ...init, headers: { ...H, ...(init.headers ?? {}) } });
-  for (const t of ["profiles", "claims", "claim_evidence", "found_items", "lost_items", "handover_codes", "audit_logs", "risk_events", "notifications", "matches"]) {
+  for (const t of ["profiles", "claims", "claim_evidence", "found_items", "lost_items", "handover_codes", "audit_logs", "risk_events", "notifications", "matches", "rewards", "perk_vouchers", "funding_records", "partners"]) {
     const r = await rest(`/${t}?select=*&limit=1`);
     const body = await r.text();
     check(`guest อ่าน ${t} ไม่ได้`, r.status === 401 || r.status === 403 || (r.status === 200 && body === "[]") || r.status === 404, `${r.status} ${body.slice(0, 80)}`);

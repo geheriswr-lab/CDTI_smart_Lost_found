@@ -7,7 +7,8 @@
 | `docs/HANDOVER.md` (ไฟล์นี้) | ผู้ดูแลเทคนิค — ภาพรวม, โครงสร้าง, ความปลอดภัย, การดูแลรักษา |
 | `docs/DEPLOYMENT.md` | ขั้นตอนขึ้นระบบจริง (Supabase + Vercel) |
 | `docs/ADMIN_GUIDE.md` | เจ้าหน้าที่ / ผู้ดูแลระบบ — วิธีใช้งานประจำวัน |
-| `docs/PHASE_1_README.md` … `PHASE_12_README.md` | รายละเอียดการออกแบบและการทดสอบแต่ละ phase |
+| `docs/SE_BUSINESS_MODEL.md` | โมเดลวิสาหกิจเพื่อสังคม / Business Model Canvas |
+| `docs/PHASE_1_README.md` … `PHASE_13_README.md` | รายละเอียดการออกแบบและการทดสอบแต่ละ phase |
 
 ---
 
@@ -57,6 +58,7 @@ Browser ──► Vercel (Next.js 14 App Router, region sin1)
 | 0025 | admin dashboard, สถิติ, escalation |
 | 0026 | Phase 11 hardening (บังคับเปลี่ยนรหัสในฐานข้อมูล, ล็อกจุดสังเกตลับ, ตัดสิทธิ์ส่วนเกิน) |
 | 0027 | แต่งตั้งเจ้าหน้าที่จากหน้า admin (`set_user_role`) |
+| 0028 | Social Enterprise: สินน้ำใจ (โหมดสาธิต), พันธมิตร/คูปอง, รายได้, `/impact` `/sponsors` — ดู `docs/SE_BUSINESS_MODEL.md` |
 
 ทุกไฟล์ idempotent (รันซ้ำได้) · migration ใหม่: เพิ่มไฟล์ `00NN_*.sql` + ต่อท้าย `setup_all.sql` + เขียน `verify/00NN_verify.sql` + ทดสอบบน staging ก่อน
 
@@ -90,7 +92,7 @@ Browser ──► Vercel (Next.js 14 App Router, region sin1)
 
 | คำสั่ง / ไฟล์ | ใช้เมื่อ |
 |---|---|
-| `npm test` (62 tests), `npm run typecheck`, `npm run lint`, `npm run build` | ทุกครั้งก่อน push |
+| `npm test` (67 tests), `npm run typecheck`, `npm run lint`, `npm run build` | ทุกครั้งก่อน push |
 | `npm run security:bundle` | หลัง build — service key ไม่หลุดไป browser |
 | `npm run security:secrets` | ก่อน push / ก่อนส่งมอบ — ไม่มีความลับใน Git history |
 | `npm run check:env` | ตรวจ env ก่อน deploy (build production รันให้อัตโนมัติ) |
@@ -126,5 +128,6 @@ Browser ──► Vercel (Next.js 14 App Router, region sin1)
 - CSP ยังใช้ `'unsafe-inline'` สำหรับ script (ข้อจำกัด Next 14) — ปรับเป็น nonce ได้
 - ยังไม่มีขั้นตอนจำหน่าย/บริจาคของที่ไม่มีผู้มารับตามระเบียบสถาบัน
 - ยังไม่มีการล้างไฟล์ที่อัปโหลดแล้วไม่ได้ใช้ใน Storage
+- สินน้ำใจยังเป็นโหมดสาธิต — เมื่อต่อผู้ให้บริการชำระเงินจริง ให้แทนที่ `pay_reward_demo` / `settle_reward` (ขออนุมัติสถาบันก่อน)
 - การจับคู่ทำตอนแจ้งของ (ไม่มี job ตามเวลา) — ใช้ `npm run rematch` เมื่อต้องการคำนวณใหม่
 - ผู้ขอเห็นสถานะภายในของคำขอผ่าน API ตรงได้ (ไม่มีข้อมูลลับ; หน้าเว็บแสดงเป็นข้อความกลาง)

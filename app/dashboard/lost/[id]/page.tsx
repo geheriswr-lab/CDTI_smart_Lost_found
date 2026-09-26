@@ -7,6 +7,9 @@ import { LOST_STATUS_TH, formatThaiDate, formatThaiDateTime } from "@/lib/report
 import { getMatchesForLostItem } from "@/lib/matching/queries";
 import { LIKELIHOOD_TH } from "@/lib/matching/score";
 import { DetailImage, DetailRow, PrivateCard, PublicCard } from "@/components/report/detail-parts";
+import { PledgeForm } from "@/components/se/se-forms";
+import { getPlatformSettings } from "@/lib/se/queries";
+import { REWARD_NAME, REWARD_STATUS_OWNER, formatBaht } from "@/lib/se/labels";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -37,6 +40,11 @@ export default async function MyLostItemPage({ params }: { params: { id: string 
     privateImageUrl(item.private_image_url),
     getMatchesForLostItem(item.id),
   ]);
+  const [settings, { data: myRewards }] = await Promise.all([getPlatformSettings(), supabase.rpc("my_rewards")]);
+  const rewardsHere = (myRewards ?? []).filter((r) => r.my_role === "owner" && r.lost_item_id === item.id && r.status !== "cancelled");
+  const pledge = rewardsHere.find((r) => r.status === "pledged") ?? null;
+  const settled = rewardsHere.find((r) => r.status !== "pledged") ?? null;
+  const canPledge = ["reported", "matched", "claim_pending"].includes(item.status);
 
   return (
     <div className="space-y-4">
@@ -63,6 +71,26 @@ export default async function MyLostItemPage({ params }: { params: { id: string 
         <DetailRow label="รายละเอียดยืนยันความเป็นเจ้าของ" value={item.private_ownership_details} />
         <DetailRow label="รูปสำหรับตรวจสอบ" value={<DetailImage src={privUrl} alt="รูปสำหรับตรวจสอบ" />} />
       </PrivateCard>
+
+      <section id="reward" className="rounded-lg border border-green-100 bg-white p-6 shadow-sm">
+        <h2 className="font-semibold text-cdti-700">{REWARD_NAME} (ไม่บังคับ)</h2>
+        <p className="mt-1 text-xs text-gray-500">
+          ขอบคุณผู้ที่ช่วยส่งคืนได้ตามความสมัครใจ · <strong>ไม่ใช่เงื่อนไขในการได้ของคืน</strong> — ไม่ว่าจะตั้งหรือไม่ การตรวจสอบและการส่งมอบเหมือนกันทุกกรณี ·
+          ไม่แสดงในประกาศสาธารณะ ผู้พบจะรู้เมื่อคืนของสำเร็จแล้วเท่านั้น · จะมอบก็ต่อเมื่อคุณได้รับของคืนแล้ว
+        </p>
+        {settled ? (
+          <p className="mt-3 text-sm">
+            {formatBaht(settled.amount)} — {REWARD_STATUS_OWNER[settled.status]}
+          </p>
+        ) : canPledge ? (
+          <div className="mt-3">
+            {pledge && <p className="mb-2 text-sm">ตั้งไว้ {formatBaht(pledge.amount)} — {REWARD_STATUS_OWNER.pledged}</p>}
+            <PledgeForm lostItemId={item.id} settings={settings} pledge={pledge ? { id: pledge.id, amount: Number(pledge.amount) } : null} />
+          </div>
+        ) : (
+          <p className="mt-3 text-sm text-gray-400">รายการนี้ปิดแล้ว</p>
+        )}
+      </section>
 
       <section id="matches" className="scroll-mt-6 rounded-lg bg-white p-6 shadow-sm">
         <h2 className="font-semibold text-cdti-700">ประกาศพบของที่อาจตรงกัน</h2>

@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import type { UserType } from "@/types/database.types";
+import { safeRedirectPath } from "@/lib/auth/redirect";
 
 export type ActionState = { error: string | null };
 
@@ -74,13 +75,18 @@ export async function signInAction(
   const { error } = await supabase.auth.signInWithPassword({ email, password });
 
   if (error) {
+    // Supabase only reports "email_not_confirmed" after the password matched,
+    // so this does not reveal whether an email is registered.
+    if (error.code === "email_not_confirmed") {
+      return { error: "กรุณายืนยันอีเมลก่อน — เปิดลิงก์ในอีเมลที่ระบบส่งให้ตอนสมัคร" };
+    }
     // Deliberately generic — don't reveal whether the email exists.
     return { error: "อีเมลหรือรหัสผ่านไม่ถูกต้อง" };
   }
 
   // middleware.ts will bounce to /change-password on the next request if
   // must_change_password is set, so redirecting to `next` here is safe.
-  redirect(next.startsWith("/") ? next : "/dashboard");
+  redirect(safeRedirectPath(next));
 }
 
 export async function signOutAction() {
@@ -132,4 +138,31 @@ export async function changePasswordAction(
   }
 
   redirect("/dashboard");
+}
+
+export type ResetRequestState = { error: string | null; sent: boolean };
+
+/**
+ * "ลืมรหัสผ่าน": always answers the same way whether or not the email is
+ * registered (no account enumeration). The emailed link goes through
+ * /auth/callback, which signs the user in and sends them to /change-password.
+ */
+export async function requestPasswordResetAction(
+  _prev: ResetRequestState,
+  formData: FormData
+): Promise<ResetRequestState> {
+  const email = String(formData.get("email") ?? "").trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) {
+    return { error: "กรุณากรอกอีเมลให้ถูกต้อง", sent: false };
+  }
+  const supabase = await createClient();
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: `${process.env.NEXT_PUBLIC_SITE_URL ?? ""}/auth/callback?next=/change-password`,
+  });
+  // Rate-limit errors are the only ones worth showing; anything else is
+  // hidden so the response never reveals whether the email exists.
+  if (error && error.status === 429) {
+    return { error: "ขอรีเซ็ตรหัสผ่านบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่", sent: false };
+  }
+  return { error: null, sent: true };
 }

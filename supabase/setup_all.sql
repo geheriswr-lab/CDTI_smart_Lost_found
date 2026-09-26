@@ -925,3 +925,2773 @@ $$;
 create trigger trg_profiles_protect_sensitive_fields
   before update on public.profiles
   for each row execute function public.protect_profile_sensitive_fields();
+
+-- ---------- migrations/0018_phase3_reporting.sql ----------
+-- =========================================================
+-- 0018_phase3_reporting.sql
+-- Phase 3 — Lost / Found Reporting
+--
+-- What this adds (all enforced in the DB, not just the UI):
+--   1. categories.is_high_value + generic category seed (idempotent).
+--      Locations are NOT seeded — real campus locations must be confirmed
+--      by the institution and added by an admin.
+--   2. Report guards on lost_items / found_items (BEFORE INSERT/UPDATE):
+--      - restricted accounts cannot create reports
+--      - new reports always start as status='reported'
+--      - finder may only self-declare custody 'with_finder' or
+--        'transferred_to_staff' (in_storage / released_to_owner are
+--        staff-only states, set later in Phase 8)
+--      - non-staff owners cannot change status / custody_status /
+--        reporter_id / finder_id after creation
+--      - dates cannot be in the future
+--      - text length limits
+--      - image columns must be object paths that the caller actually
+--        uploaded into the correct bucket under their own folder
+--        (<auth.uid()>/...). This stops a user from pointing
+--        public_image_url at an arbitrary external URL, or at someone
+--        else's private evidence file.
+--      - simple anti-spam limit: max 10 reports / hour / user / table
+--   3. AFTER INSERT triggers (SECURITY DEFINER) that write:
+--      - audit_logs  ('lost_item.created' / 'found_item.created')
+--      - custody_history initial entry for found items
+--      Both tables have no client INSERT policy, so these rows cannot be
+--      forged or skipped by the client. Metadata never contains private
+--      or secret fields.
+--
+-- Image column convention (from Phase 3 on):
+--   public_image_url  = object path in bucket 'item-images-public'
+--   private_image_url = object path in bucket 'verification-private'
+--   e.g. '6f1c…/lost/2b9e….jpg'. The app builds the public URL with
+--   storage.getPublicUrl() and private images are only ever served via
+--   short-lived signed URLs to the owner / staff.
+--
+-- Service-role / SQL-editor sessions (auth.uid() is null) bypass the
+-- per-user checks so admins can still fix data manually.
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1. Categories: high-value flag + seed
+-- ---------------------------------------------------------
+alter table public.categories
+  add column if not exists is_high_value boolean not null default false;
+
+comment on column public.categories.is_high_value is
+  'UI hint: finders are strongly advised to hand these items to the central drop-off point. Also used by Phase 6 to pick verification_level.';
+
+insert into public.categories (name_th, name_en, is_high_value)
+select v.name_th, v.name_en, v.is_high_value
+from (values
+  ('โทรศัพท์มือถือ',              'Mobile phone',          true),
+  ('คอมพิวเตอร์ / แท็บเล็ต',       'Laptop / Tablet',       true),
+  ('อุปกรณ์อิเล็กทรอนิกส์อื่น ๆ',   'Other electronics',     true),
+  ('กระเป๋าสตางค์',                'Wallet',                true),
+  ('เครื่องประดับ / นาฬิกา',        'Jewelry / Watch',       true),
+  ('กุญแจ',                       'Keys',                  false),
+  ('บัตร (บัตรนักศึกษา / บัตรต่าง ๆ)','Cards',                false),
+  ('กระเป๋า',                     'Bag',                   false),
+  ('เอกสาร / หนังสือ',             'Documents / Books',     false),
+  ('เสื้อผ้า / เครื่องแต่งกาย',       'Clothing',              false),
+  ('ขวดน้ำ / ภาชนะ',               'Bottle / Container',    false),
+  ('เครื่องเขียน',                  'Stationery',            false),
+  ('อื่น ๆ',                        'Other',                 false)
+) as v(name_th, name_en, is_high_value)
+where not exists (
+  select 1 from public.categories c where c.name_th = v.name_th
+);
+
+-- ---------------------------------------------------------
+-- 2. Shared helpers
+-- ---------------------------------------------------------
+
+-- True when `path` is an object the current user uploaded into `bucket`
+-- under their own folder. SECURITY DEFINER so it can read storage.objects
+-- regardless of storage RLS.
+create or replace function public.is_own_storage_object(bucket text, path text)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public, storage
+as $$
+  select
+    path is not null
+    and auth.uid() is not null
+    and split_part(path, '/', 1) = auth.uid()::text
+    and position('..' in path) = 0
+    and exists (
+      select 1 from storage.objects o
+      where o.bucket_id = bucket and o.name = path
+    );
+$$;
+
+revoke all on function public.is_own_storage_object(text, text) from public;
+grant execute on function public.is_own_storage_object(text, text) to authenticated;
+
+create or replace function public.assert_max_len(val text, max_len int, field text)
+returns void
+language plpgsql
+immutable
+as $$
+begin
+  if val is not null and char_length(val) > max_len then
+    raise exception 'REPORT_INVALID: % exceeds % characters', field, max_len
+      using errcode = 'check_violation';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 3. lost_items guard
+-- ---------------------------------------------------------
+create or replace function public.guard_lost_item_report()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  is_staff boolean := public.is_staff_or_admin();
+  recent_count int;
+begin
+  -- Trusted server context (service role / SQL editor): skip user checks.
+  if uid is null then
+    return new;
+  end if;
+
+  -- Field validation (insert and update).
+  if char_length(btrim(coalesce(new.item_name, ''))) = 0 then
+    raise exception 'REPORT_INVALID: item_name is required' using errcode = 'check_violation';
+  end if;
+  perform public.assert_max_len(new.item_name, 120, 'item_name');
+  perform public.assert_max_len(new.brand, 80, 'brand');
+  perform public.assert_max_len(new.color, 50, 'color');
+  perform public.assert_max_len(new.description, 2000, 'description');
+  perform public.assert_max_len(new.private_ownership_details, 2000, 'private_ownership_details');
+
+  if new.lost_date is not null
+     and new.lost_date > (now() at time zone 'Asia/Bangkok')::date then
+    raise exception 'REPORT_INVALID: lost_date cannot be in the future' using errcode = 'check_violation';
+  end if;
+
+  if tg_op = 'INSERT' then
+    if exists (select 1 from public.profiles p where p.id = uid and p.is_restricted) then
+      raise exception 'REPORT_FORBIDDEN: account is restricted' using errcode = 'insufficient_privilege';
+    end if;
+
+    if not is_staff then
+      new.status := 'reported';
+
+      select count(*) into recent_count
+      from public.lost_items
+      where reporter_id = uid and created_at > now() - interval '1 hour';
+      if recent_count >= 10 then
+        raise exception 'REPORT_RATE_LIMIT: too many reports' using errcode = 'check_violation';
+      end if;
+    end if;
+  else
+    -- UPDATE by a non-staff owner: lifecycle fields are not theirs to change.
+    if not is_staff then
+      if new.reporter_id is distinct from old.reporter_id
+         or new.status is distinct from old.status then
+        raise exception 'REPORT_FORBIDDEN: cannot change reporter or status' using errcode = 'insufficient_privilege';
+      end if;
+    end if;
+  end if;
+
+  -- Image paths: only validate when set/changed, so staff edits of other
+  -- fields don't fail on paths uploaded by the reporter.
+  if new.public_image_url is not null
+     and (tg_op = 'INSERT' or new.public_image_url is distinct from old.public_image_url)
+     and not public.is_own_storage_object('item-images-public', new.public_image_url) then
+    raise exception 'REPORT_INVALID: public_image_url must be your own upload in item-images-public'
+      using errcode = 'check_violation';
+  end if;
+
+  if new.private_image_url is not null
+     and (tg_op = 'INSERT' or new.private_image_url is distinct from old.private_image_url)
+     and not public.is_own_storage_object('verification-private', new.private_image_url) then
+    raise exception 'REPORT_INVALID: private_image_url must be your own upload in verification-private'
+      using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_lost_items_guard on public.lost_items;
+create trigger trg_lost_items_guard
+  before insert or update on public.lost_items
+  for each row execute function public.guard_lost_item_report();
+
+-- ---------------------------------------------------------
+-- 4. found_items guard
+-- ---------------------------------------------------------
+create or replace function public.guard_found_item_report()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  is_staff boolean := public.is_staff_or_admin();
+  recent_count int;
+begin
+  if uid is null then
+    return new;
+  end if;
+
+  if char_length(btrim(coalesce(new.general_name, ''))) = 0 then
+    raise exception 'REPORT_INVALID: general_name is required' using errcode = 'check_violation';
+  end if;
+  perform public.assert_max_len(new.general_name, 120, 'general_name');
+  perform public.assert_max_len(new.color, 50, 'color');
+  perform public.assert_max_len(new.description, 2000, 'description');
+  perform public.assert_max_len(new.exact_location, 300, 'exact_location');
+  perform public.assert_max_len(new.serial_number, 120, 'serial_number');
+  perform public.assert_max_len(new.secret_details, 2000, 'secret_details');
+
+  if new.found_date is not null
+     and new.found_date > (now() at time zone 'Asia/Bangkok')::date then
+    raise exception 'REPORT_INVALID: found_date cannot be in the future' using errcode = 'check_violation';
+  end if;
+  if new.exact_time is not null and new.exact_time > now() + interval '5 minutes' then
+    raise exception 'REPORT_INVALID: exact_time cannot be in the future' using errcode = 'check_violation';
+  end if;
+
+  if tg_op = 'INSERT' then
+    if exists (select 1 from public.profiles p where p.id = uid and p.is_restricted) then
+      raise exception 'REPORT_FORBIDDEN: account is restricted' using errcode = 'insufficient_privilege';
+    end if;
+
+    if not is_staff then
+      new.status := 'reported';
+
+      -- A finder can only self-declare where the item is right now.
+      -- in_storage / released_to_owner are set by staff (Phase 8).
+      if new.custody_status not in ('with_finder', 'transferred_to_staff') then
+        raise exception 'REPORT_INVALID: invalid initial custody_status' using errcode = 'check_violation';
+      end if;
+
+      select count(*) into recent_count
+      from public.found_items
+      where finder_id = uid and created_at > now() - interval '1 hour';
+      if recent_count >= 10 then
+        raise exception 'REPORT_RATE_LIMIT: too many reports' using errcode = 'check_violation';
+      end if;
+    end if;
+  else
+    if not is_staff then
+      if new.finder_id is distinct from old.finder_id
+         or new.status is distinct from old.status
+         or new.custody_status is distinct from old.custody_status then
+        raise exception 'REPORT_FORBIDDEN: cannot change finder, status or custody' using errcode = 'insufficient_privilege';
+      end if;
+    end if;
+  end if;
+
+  if new.public_image_url is not null
+     and (tg_op = 'INSERT' or new.public_image_url is distinct from old.public_image_url)
+     and not public.is_own_storage_object('item-images-public', new.public_image_url) then
+    raise exception 'REPORT_INVALID: public_image_url must be your own upload in item-images-public'
+      using errcode = 'check_violation';
+  end if;
+
+  if new.private_image_url is not null
+     and (tg_op = 'INSERT' or new.private_image_url is distinct from old.private_image_url)
+     and not public.is_own_storage_object('verification-private', new.private_image_url) then
+    raise exception 'REPORT_INVALID: private_image_url must be your own upload in verification-private'
+      using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_found_items_guard on public.found_items;
+create trigger trg_found_items_guard
+  before insert or update on public.found_items
+  for each row execute function public.guard_found_item_report();
+
+-- ---------------------------------------------------------
+-- 5. Audit + custody history on create (tamper-resistant)
+-- ---------------------------------------------------------
+create or replace function public.log_lost_item_created()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (
+    auth.uid(),
+    'lost_item.created',
+    'lost_item',
+    new.id,
+    -- Public-safe fields only. Never private_ownership_details / private_image_url.
+    jsonb_build_object(
+      'category_id', new.category_id,
+      'location_id', new.location_id,
+      'has_public_image', new.public_image_url is not null,
+      'has_private_image', new.private_image_url is not null
+    )
+  );
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_lost_items_created_log on public.lost_items;
+create trigger trg_lost_items_created_log
+  after insert on public.lost_items
+  for each row execute function public.log_lost_item_created();
+
+create or replace function public.log_found_item_created()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.custody_history (found_item_id, from_status, to_status, handled_by, notes)
+  values (
+    new.id,
+    null,
+    new.custody_status,
+    new.finder_id,
+    'Initial custody status declared by finder at report time (not yet confirmed by staff)'
+  );
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (
+    auth.uid(),
+    'found_item.created',
+    'found_item',
+    new.id,
+    -- Never include secret_details / serial_number / exact_location / exact_time.
+    jsonb_build_object(
+      'category_id', new.category_id,
+      'location_id', new.location_id,
+      'custody_status', new.custody_status,
+      'has_public_image', new.public_image_url is not null,
+      'has_private_image', new.private_image_url is not null
+    )
+  );
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_found_items_created_log on public.found_items;
+create trigger trg_found_items_created_log
+  after insert on public.found_items
+  for each row execute function public.log_found_item_created();
+
+-- ---------------------------------------------------------
+-- 6. Storage: file size / type limits on the two buckets
+--    (defense in depth — the app validates too)
+-- ---------------------------------------------------------
+update storage.buckets
+set file_size_limit = 5 * 1024 * 1024,
+    allowed_mime_types = array['image/jpeg', 'image/png', 'image/webp']
+where id = 'item-images-public';
+
+update storage.buckets
+set file_size_limit = 5 * 1024 * 1024,
+    allowed_mime_types = array['image/jpeg', 'image/png', 'image/webp', 'application/pdf']
+where id = 'verification-private';
+
+-- ---------- migrations/0019_phase4_public_listing.sql ----------
+-- =========================================================
+-- 0019_phase4_public_listing.sql
+-- Phase 4 — Public Listing + Search
+--
+-- 1. Anonymous public image paths.
+--    Until now public images were stored as '<auth.uid()>/<kind>/<file>'.
+--    That path is part of the public URL, so every listing photo leaked the
+--    reporter's / finder's user id (and let anyone link all items reported
+--    by the same person). New public uploads go to '<kind>/<random>.<ext>'
+--    (kind = lost|found) and ownership is tracked by storage.objects.owner_id
+--    (set by the Storage API from the uploader's JWT), not by the path.
+--    The private bucket keeps the '<uid>/...' convention — its paths are
+--    never shown publicly.
+--
+-- 2. is_own_storage_object() now accepts either owner_id = caller or the
+--    legacy '<uid>/' folder, so Phase 3 rows stay valid.
+--
+-- 3. Search indexes for the public listing filters.
+--
+-- 4. Explicit grants: anon/authenticated may read the public views, and
+--    anon gets NO privileges on the base report tables at all (RLS already
+--    returns zero rows; this removes the table from anon's reach entirely).
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1. Public bucket policies
+-- ---------------------------------------------------------
+drop policy if exists storage_public_images_insert_own_folder on storage.objects;
+drop policy if exists storage_public_images_insert_anonymous_path on storage.objects;
+create policy storage_public_images_insert_anonymous_path
+  on storage.objects for insert
+  to authenticated
+  with check (
+    bucket_id = 'item-images-public'
+    and (storage.foldername(name))[1] in ('lost', 'found')
+    and array_length(storage.foldername(name), 1) = 1
+  );
+
+drop policy if exists storage_public_images_delete_own_or_staff on storage.objects;
+create policy storage_public_images_delete_own_or_staff
+  on storage.objects for delete
+  using (
+    bucket_id = 'item-images-public'
+    and (
+      owner_id = auth.uid()::text
+      or (storage.foldername(name))[1] = auth.uid()::text   -- legacy Phase 3 paths
+      or public.is_staff_or_admin()
+    )
+  );
+
+-- ---------------------------------------------------------
+-- 2. Ownership check used by the report guards (0018)
+-- ---------------------------------------------------------
+create or replace function public.is_own_storage_object(bucket text, path text)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public, storage
+as $$
+  select
+    path is not null
+    and auth.uid() is not null
+    and position('..' in path) = 0
+    and exists (
+      select 1 from storage.objects o
+      where o.bucket_id = bucket
+        and o.name = path
+        and (
+          o.owner_id = auth.uid()::text
+          or split_part(path, '/', 1) = auth.uid()::text
+        )
+    );
+$$;
+
+revoke all on function public.is_own_storage_object(text, text) from public;
+grant execute on function public.is_own_storage_object(text, text) to authenticated;
+
+-- ---------------------------------------------------------
+-- 3. Indexes for listing / search
+-- ---------------------------------------------------------
+create index if not exists idx_lost_items_public_listing
+  on public.lost_items (status, created_at desc);
+create index if not exists idx_lost_items_category on public.lost_items (category_id);
+create index if not exists idx_lost_items_location on public.lost_items (location_id);
+create index if not exists idx_lost_items_lost_date on public.lost_items (lost_date);
+
+create index if not exists idx_found_items_public_listing
+  on public.found_items (status, created_at desc);
+create index if not exists idx_found_items_category on public.found_items (category_id);
+create index if not exists idx_found_items_location on public.found_items (location_id);
+create index if not exists idx_found_items_found_date on public.found_items (found_date);
+
+-- ---------------------------------------------------------
+-- 4. Grants
+-- ---------------------------------------------------------
+revoke all on public.lost_items from anon;
+revoke all on public.found_items from anon;
+
+grant select on public.public_lost_items to anon, authenticated;
+grant select on public.public_found_items to anon, authenticated;
+
+-- ---------- migrations/0020_phase5_matching.sql ----------
+-- =========================================================
+-- 0020_phase5_matching.sql
+-- Phase 5 — Smart Matching
+--
+-- Matching itself runs in the app server (src/lib/matching/*) with the
+-- service-role key, because Thai keyword matching needs proper word
+-- segmentation (Intl.Segmenter) that Postgres doesn't provide. The DB side
+-- only needs:
+--   1. Notifications: users may flip is_read on their own rows and NOTHING
+--      else. The Phase 1 UPDATE policy limits rows but not columns, so a
+--      user could previously rewrite title/message/payload/type/user_id of
+--      their own notifications via the API. Column-level privilege fixes it.
+--   2. anon gets no privileges on matches / notifications.
+--   3. Indexes for "matches of my lost item" and "my unread notifications".
+--
+-- matches / notifications / audit_logs still have NO client INSERT policy:
+-- only the service-role matching job can create them.
+-- =========================================================
+
+-- Guests never need these tables at all.
+revoke all on public.matches from anon;
+revoke all on public.notifications from anon;
+
+revoke update on public.notifications from anon, authenticated;
+grant update (is_read) on public.notifications to authenticated;
+
+create index if not exists idx_matches_lost_score
+  on public.matches (lost_item_id, score desc);
+create index if not exists idx_matches_found
+  on public.matches (found_item_id);
+create index if not exists idx_notifications_user_unread
+  on public.notifications (user_id, is_read, created_at desc);
+
+-- ---------- migrations/0021_phase6_claims.sql ----------
+-- =========================================================
+-- 0021_phase6_claims.sql
+-- Phase 6 — Claim + Ownership Verification
+--
+-- SECURITY FIX: the Phase 1 policies let a claimant INSERT/UPDATE their own
+-- claims row with ANY column values — including status='approved'. From
+-- now on clients cannot write `claims` at all; every write goes through a
+-- SECURITY DEFINER function that enforces the rules:
+--
+--   submit_claim(found_item_id, answers, match_id)   claimant
+--   cancel_claim(claim_id)                           claimant
+--   review_claim(claim_id, outcome, checklist, note) staff / admin
+--
+-- Rules enforced here (not just in the UI):
+--   * cannot claim your own found item; restricted accounts cannot claim
+--   * one claim row per (claimant, found item); re-submission only after
+--     'insufficient' or 'cancelled', after a 24h cooldown, max 3 attempts
+--     (claim_attempt_count). 'rejected' is final.
+--   * per-user rate limit: max 3 new claims / 24h, max 5 active claims
+--   * verification_level = 'enhanced' for high-value categories
+--   * enhanced claims can only be APPROVED after a 'verified' review step
+--   * reviewer may not be the claimant or the finder
+--   * claimant notifications use neutral wording and never say which
+--     answer was wrong (anti-guessing)
+--   * staff checklist + notes live in claim_reviews (staff-only), so they
+--     are never readable by the claimant
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1. Questionnaire type per category
+-- ---------------------------------------------------------
+alter table public.categories
+  add column if not exists claim_form text not null default 'general';
+
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'categories_claim_form_check') then
+    alter table public.categories
+      add constraint categories_claim_form_check
+      check (claim_form in ('general', 'wallet', 'key', 'electronics'));
+  end if;
+end $$;
+
+update public.categories set claim_form = 'wallet'
+  where name_en = 'Wallet' and claim_form = 'general';
+update public.categories set claim_form = 'key'
+  where name_en = 'Keys' and claim_form = 'general';
+update public.categories set claim_form = 'electronics'
+  where name_en in ('Mobile phone', 'Laptop / Tablet', 'Other electronics') and claim_form = 'general';
+
+-- ---------------------------------------------------------
+-- 2. claims: lock down direct writes
+-- ---------------------------------------------------------
+drop policy if exists claims_insert_claimant on public.claims;
+drop policy if exists claims_update_claimant on public.claims;
+drop policy if exists claims_update_staff on public.claims;
+
+revoke insert, update, delete on public.claims from anon, authenticated;
+revoke all on public.claims from anon;
+
+create unique index if not exists uq_claims_claimant_item
+  on public.claims (claimant_id, found_item_id);
+create index if not exists idx_claims_found_item on public.claims (found_item_id);
+create index if not exists idx_claims_status on public.claims (status, created_at desc);
+
+-- ---------------------------------------------------------
+-- 3. claim_reviews: staff checklist + decision history (staff-only)
+-- ---------------------------------------------------------
+create table if not exists public.claim_reviews (
+  id           uuid primary key default gen_random_uuid(),
+  claim_id     uuid not null references public.claims(id) on delete cascade,
+  reviewer_id  uuid not null references public.profiles(id),
+  from_status  public.claim_status_enum not null,
+  outcome      public.claim_status_enum not null,
+  checklist    jsonb not null default '{}'::jsonb,
+  note         text,
+  created_at   timestamptz not null default now()
+);
+
+alter table public.claim_reviews enable row level security;
+
+drop policy if exists claim_reviews_select_staff on public.claim_reviews;
+create policy claim_reviews_select_staff
+  on public.claim_reviews for select
+  using (public.is_staff_or_admin());
+
+revoke insert, update, delete on public.claim_reviews from anon, authenticated;
+revoke all on public.claim_reviews from anon;
+create index if not exists idx_claim_reviews_claim on public.claim_reviews (claim_id, created_at desc);
+
+-- ---------------------------------------------------------
+-- 4. claim_evidence: path + count guard
+-- ---------------------------------------------------------
+revoke all on public.claim_evidence from anon;
+
+create or replace function public.guard_claim_evidence()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  c public.claims%rowtype;
+begin
+  if uid is null then
+    return new;  -- service context
+  end if;
+
+  select * into c from public.claims where id = new.claim_id;
+  if not found or c.claimant_id <> uid then
+    raise exception 'CLAIM_NOT_ALLOWED: not your claim' using errcode = 'insufficient_privilege';
+  end if;
+  if c.status not in ('pending', 'insufficient') then
+    raise exception 'CLAIM_NOT_ALLOWED: evidence closed for this claim' using errcode = 'check_violation';
+  end if;
+  if new.evidence_url not like uid::text || '/claims/' || new.claim_id::text || '/%'
+     or not public.is_own_storage_object('verification-private', new.evidence_url) then
+    raise exception 'CLAIM_INVALID: evidence must be your own private upload for this claim' using errcode = 'check_violation';
+  end if;
+  if (select count(*) from public.claim_evidence where claim_id = new.claim_id) >= 5 then
+    raise exception 'CLAIM_INVALID: too many evidence files' using errcode = 'check_violation';
+  end if;
+  if new.description is not null and char_length(new.description) > 300 then
+    raise exception 'CLAIM_INVALID: description too long' using errcode = 'check_violation';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_claim_evidence_guard on public.claim_evidence;
+create trigger trg_claim_evidence_guard
+  before insert on public.claim_evidence
+  for each row execute function public.guard_claim_evidence();
+
+-- ---------------------------------------------------------
+-- 5. submit_claim
+-- ---------------------------------------------------------
+create or replace function public.submit_claim(
+  p_found_item_id uuid,
+  p_answers jsonb,
+  p_match_id uuid default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_finder uuid;
+  v_status public.found_item_status_enum;
+  v_high boolean;
+  v_claim public.claims%rowtype;
+  v_count int;
+begin
+  if uid is null then
+    raise exception 'CLAIM_NOT_ALLOWED: not authenticated' using errcode = 'insufficient_privilege';
+  end if;
+  if exists (select 1 from public.profiles where id = uid and is_restricted) then
+    raise exception 'CLAIM_NOT_ALLOWED: account restricted' using errcode = 'insufficient_privilege';
+  end if;
+
+  select fi.finder_id, fi.status, coalesce(c.is_high_value, false)
+    into v_finder, v_status, v_high
+  from public.found_items fi
+  left join public.categories c on c.id = fi.category_id
+  where fi.id = p_found_item_id;
+
+  if not found or v_status not in ('reported', 'in_custody', 'matched', 'claim_pending') then
+    raise exception 'CLAIM_NOT_AVAILABLE: item not open for claims' using errcode = 'check_violation';
+  end if;
+  if v_finder = uid then
+    raise exception 'CLAIM_NOT_ALLOWED: cannot claim an item you reported as found' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_answers is null or jsonb_typeof(p_answers) <> 'object' or pg_column_size(p_answers) > 16000 then
+    raise exception 'CLAIM_INVALID: answers' using errcode = 'check_violation';
+  end if;
+
+  -- A match may only be linked if it is the caller's own lost item matched to THIS found item.
+  if p_match_id is not null and not exists (
+    select 1 from public.matches m
+    join public.lost_items li on li.id = m.lost_item_id
+    where m.id = p_match_id and m.found_item_id = p_found_item_id and li.reporter_id = uid
+  ) then
+    p_match_id := null;
+  end if;
+
+  select * into v_claim from public.claims
+  where claimant_id = uid and found_item_id = p_found_item_id
+  for update;
+
+  if found then
+    if v_claim.status = 'rejected' or v_claim.claim_attempt_count >= 3 then
+      raise exception 'CLAIM_LOCKED: no further attempts' using errcode = 'check_violation';
+    end if;
+    if v_claim.status not in ('insufficient', 'cancelled') then
+      raise exception 'CLAIM_ALREADY_ACTIVE: claim in progress' using errcode = 'check_violation';
+    end if;
+    if v_claim.last_attempt_at > now() - interval '24 hours' then
+      raise exception 'CLAIM_COOLDOWN: try again later' using errcode = 'check_violation';
+    end if;
+
+    update public.claims
+    set answers = p_answers,
+        status = 'pending',
+        claim_attempt_count = claim_attempt_count + 1,
+        last_attempt_at = now(),
+        match_id = coalesce(p_match_id, match_id),
+        reviewed_by = null,
+        reviewed_at = null
+    where id = v_claim.id
+    returning * into v_claim;
+  else
+    select count(*) into v_count from public.claims
+    where claimant_id = uid and created_at > now() - interval '24 hours';
+    if v_count >= 3 then
+      raise exception 'CLAIM_RATE_LIMIT: daily limit' using errcode = 'check_violation';
+    end if;
+
+    select count(*) into v_count from public.claims
+    where claimant_id = uid and status in ('pending', 'needs_review', 'likely_owner', 'verified', 'disputed');
+    if v_count >= 5 then
+      raise exception 'CLAIM_RATE_LIMIT: too many active claims' using errcode = 'check_violation';
+    end if;
+
+    insert into public.claims (
+      claimant_id, found_item_id, match_id, status, verification_level,
+      answers, claim_attempt_count, last_attempt_at
+    ) values (
+      uid, p_found_item_id, p_match_id, 'pending',
+      case when v_high then 'enhanced'::public.verification_level_enum else 'standard'::public.verification_level_enum end,
+      p_answers, 1, now()
+    )
+    returning * into v_claim;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'claim.submitted', 'claim', v_claim.id, jsonb_build_object(
+    'found_item_id', p_found_item_id,
+    'attempt', v_claim.claim_attempt_count,
+    'verification_level', v_claim.verification_level
+  ));  -- never the answers
+
+  insert into public.notifications (user_id, type, title, message, payload)
+  select p.id, 'claim_review_required', 'มีคำขอรับของรอตรวจสอบ',
+         'มีผู้ส่งคำขอรับของ 1 รายการ รอเจ้าหน้าที่ตรวจสอบ',
+         jsonb_build_object('claim_id', v_claim.id)
+  from public.profiles p
+  where p.role in ('staff', 'admin') and p.id <> uid;
+
+  return v_claim.id;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 6. cancel_claim
+-- ---------------------------------------------------------
+create or replace function public.cancel_claim(p_claim_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_claim public.claims%rowtype;
+begin
+  select * into v_claim from public.claims where id = p_claim_id for update;
+  if not found or v_claim.claimant_id is distinct from uid then
+    raise exception 'CLAIM_NOT_ALLOWED: not your claim' using errcode = 'insufficient_privilege';
+  end if;
+  if v_claim.status not in ('pending', 'needs_review', 'insufficient') then
+    raise exception 'CLAIM_NOT_ALLOWED: claim can no longer be cancelled' using errcode = 'check_violation';
+  end if;
+
+  update public.claims set status = 'cancelled' where id = p_claim_id;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'claim.cancelled', 'claim', p_claim_id, jsonb_build_object('from_status', v_claim.status));
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 7. review_claim (staff / admin)
+-- ---------------------------------------------------------
+create or replace function public.review_claim(
+  p_claim_id uuid,
+  p_outcome public.claim_status_enum,
+  p_checklist jsonb default '{}'::jsonb,
+  p_note text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_claim public.claims%rowtype;
+  v_finder uuid;
+  v_item_status public.found_item_status_enum;
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'CLAIM_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_outcome not in ('insufficient', 'needs_review', 'likely_owner', 'verified', 'approved', 'rejected') then
+    raise exception 'CLAIM_INVALID: outcome' using errcode = 'check_violation';
+  end if;
+  if p_checklist is null or jsonb_typeof(p_checklist) <> 'object' or pg_column_size(p_checklist) > 8000 then
+    raise exception 'CLAIM_INVALID: checklist' using errcode = 'check_violation';
+  end if;
+  if p_note is not null and char_length(p_note) > 2000 then
+    raise exception 'CLAIM_INVALID: note too long' using errcode = 'check_violation';
+  end if;
+
+  select * into v_claim from public.claims where id = p_claim_id for update;
+  if not found then
+    raise exception 'CLAIM_INVALID: claim not found' using errcode = 'check_violation';
+  end if;
+  if v_claim.status in ('approved', 'rejected', 'cancelled') then
+    raise exception 'CLAIM_FINAL: claim already closed' using errcode = 'check_violation';
+  end if;
+
+  select finder_id, status into v_finder, v_item_status from public.found_items where id = v_claim.found_item_id;
+  if uid = v_claim.claimant_id or uid = v_finder then
+    raise exception 'CLAIM_CONFLICT: reviewer is involved in this claim' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_outcome = 'approved' then
+    if v_item_status not in ('reported', 'in_custody', 'matched', 'claim_pending') then
+      raise exception 'CLAIM_NOT_AVAILABLE: item no longer available' using errcode = 'check_violation';
+    end if;
+    if v_claim.verification_level = 'enhanced' and v_claim.status <> 'verified' then
+      raise exception 'CLAIM_ENHANCED: enhanced claims must be verified before approval' using errcode = 'check_violation';
+    end if;
+    if v_claim.verification_level = 'standard' and v_claim.status not in ('likely_owner', 'verified') then
+      raise exception 'CLAIM_INVALID: approve only after likely_owner or verified' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  update public.claims
+  set status = p_outcome, reviewed_by = uid, reviewed_at = now()
+  where id = p_claim_id;
+
+  insert into public.claim_reviews (claim_id, reviewer_id, from_status, outcome, checklist, note)
+  values (p_claim_id, uid, v_claim.status, p_outcome, p_checklist, p_note);
+
+  if p_outcome = 'approved' then
+    update public.found_items set status = 'verified' where id = v_claim.found_item_id;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'claim.reviewed', 'claim', p_claim_id,
+          jsonb_build_object('from_status', v_claim.status, 'outcome', p_outcome));
+
+  -- Claimant-facing messages: neutral, never say which answer was wrong.
+  -- Intermediate outcomes (needs_review / likely_owner / verified) send nothing.
+  if p_outcome in ('insufficient', 'approved', 'rejected') then
+    insert into public.notifications (user_id, type, title, message, payload)
+    values (
+      v_claim.claimant_id,
+      case p_outcome when 'approved' then 'claim_approved'
+                     when 'rejected' then 'claim_rejected'
+                     else 'claim_more_info' end,
+      case p_outcome when 'approved' then 'คำขอรับของผ่านการตรวจสอบแล้ว'
+                     when 'rejected' then 'ผลการตรวจสอบคำขอรับของ'
+                     else 'ต้องการข้อมูลเพิ่มเติม' end,
+      case p_outcome
+        when 'approved' then 'เจ้าหน้าที่จะแจ้งขั้นตอนและสถานที่รับของให้ทราบ กรุณาเตรียมบัตรประจำตัวมาในวันรับของ'
+        when 'rejected' then 'ไม่สามารถยืนยันความเป็นเจ้าของได้จากข้อมูลที่ได้รับ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่'
+        else 'ข้อมูลที่ได้รับยังไม่เพียงพอสำหรับการยืนยัน คุณสามารถส่งข้อมูลเพิ่มเติมได้หลังครบระยะเวลารอ 24 ชั่วโมง'
+      end,
+      jsonb_build_object('claim_id', p_claim_id)
+    );
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 8. Function privileges
+-- ---------------------------------------------------------
+revoke all on function public.submit_claim(uuid, jsonb, uuid) from public, anon;
+revoke all on function public.cancel_claim(uuid) from public, anon;
+revoke all on function public.review_claim(uuid, public.claim_status_enum, jsonb, text) from public, anon;
+grant execute on function public.submit_claim(uuid, jsonb, uuid) to authenticated;
+grant execute on function public.cancel_claim(uuid) to authenticated;
+grant execute on function public.review_claim(uuid, public.claim_status_enum, jsonb, text) to authenticated;
+
+-- ---------- migrations/0022_phase7_risk_dispute.sql ----------
+-- =========================================================
+-- 0022_phase7_risk_dispute.sql
+-- Phase 7 — Risk Detection + Dispute
+--
+-- Everything runs as triggers on public.claims, so it fires regardless of
+-- which code path changed a claim and cannot be skipped by a client.
+--
+-- RISK SIGNALS (written to risk_events, staff-only):
+--   frequent_claims         >= 5 new claims in 7 days (medium), >= 8 (high)
+--   repeated_rejections     >= 3 rejected/insufficient outcomes in 30 days (medium), >= 5 (high)
+--   duplicate_claim_target  2nd attempt on the same item (low), 3rd (medium)
+--   answer_changed          >= 2 answers contradict the previous attempt (medium)
+--   new_account_high_value  account < 7 days old claims a high-value item (medium)
+-- Signals only FLAG for human review. Nothing is decided automatically,
+-- and labels are neutral — the DB rejects any resolution outside a fixed
+-- neutral vocabulary (no "thief"/"scammer" etc.).
+--
+-- DISPUTES:
+--   When a claim becomes active (new or re-submitted) while another active
+--   claim exists for the same found item, ALL active claims on that item
+--   become 'disputed' and staff are notified. A claim cannot be APPROVED
+--   while any other active claim exists on the same item — that is the
+--   handover suspension (Phase 8 hands over only approved claims).
+--   Claimants still only see "อยู่ระหว่างตรวจสอบ"; they are never told
+--   that someone else claimed the item.
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1. risk_events: details, neutral vocabulary, locked writes
+-- ---------------------------------------------------------
+alter table public.risk_events add column if not exists details jsonb not null default '{}'::jsonb;
+alter table public.risk_events add column if not exists resolution_note text;
+
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'risk_events_event_type_check') then
+    alter table public.risk_events add constraint risk_events_event_type_check
+      check (event_type in ('frequent_claims', 'repeated_rejections', 'duplicate_claim_target',
+                            'answer_changed', 'new_account_high_value')) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'risk_events_resolution_check') then
+    alter table public.risk_events add constraint risk_events_resolution_check
+      check (resolution is null or resolution in ('needs_review', 'suspicious_activity', 'cleared', 'account_restricted')) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'risk_events_resolution_note_len') then
+    alter table public.risk_events add constraint risk_events_resolution_note_len
+      check (resolution_note is null or char_length(resolution_note) <= 1000) not valid;
+  end if;
+end $$;
+
+-- Staff change risk events only through resolve_risk_event() (audited).
+drop policy if exists risk_events_update_staff on public.risk_events;
+revoke insert, update, delete on public.risk_events from anon, authenticated;
+revoke all on public.risk_events from anon;
+
+create index if not exists idx_risk_events_open on public.risk_events (resolved_at, created_at desc);
+create index if not exists idx_risk_events_user on public.risk_events (related_user_id, created_at desc);
+
+-- ---------------------------------------------------------
+-- 2. Internal helper: raise (or escalate) a risk event
+-- ---------------------------------------------------------
+create or replace function public.raise_risk_event(
+  p_type text,
+  p_level public.risk_level_enum,
+  p_user uuid,
+  p_item uuid,
+  p_claim uuid,
+  p_details jsonb default '{}'::jsonb
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_existing public.risk_events%rowtype;
+begin
+  -- De-duplicate: one open event per (type, user, claim-or-item) per 7 days;
+  -- a repeat only escalates the level and refreshes details.
+  select * into v_existing from public.risk_events
+  where event_type = p_type
+    and related_user_id is not distinct from p_user
+    and coalesce(related_claim_id, related_item_id) is not distinct from coalesce(p_claim, p_item)
+    and resolved_at is null
+    and created_at > now() - interval '7 days'
+  order by created_at desc
+  limit 1
+  for update;
+
+  if found then
+    update public.risk_events
+    set risk_level = greatest(risk_level, p_level),
+        details = p_details
+    where id = v_existing.id;
+    return;
+  end if;
+
+  insert into public.risk_events (event_type, risk_level, related_user_id, related_item_id, related_claim_id, details)
+  values (p_type, p_level, p_user, p_item, p_claim, coalesce(p_details, '{}'::jsonb));
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (null, 'risk.flagged', 'user', p_user,
+          jsonb_build_object('event_type', p_type, 'risk_level', p_level, 'claim_id', p_claim));
+end;
+$$;
+
+revoke all on function public.raise_risk_event(text, public.risk_level_enum, uuid, uuid, uuid, jsonb) from public, anon, authenticated;
+
+-- ---------------------------------------------------------
+-- 3. Answer comparison: how many answers contradict the previous attempt
+--    (an answer that is merely extended/refined does not count)
+-- ---------------------------------------------------------
+create or replace function public.contradicted_answer_keys(p_old jsonb, p_new jsonb)
+returns text[]
+language sql
+immutable
+as $$
+  select coalesce(array_agg(o.key order by o.key), '{}')
+  from jsonb_each_text(coalesce(p_old, '{}'::jsonb)) o
+  join jsonb_each_text(coalesce(p_new, '{}'::jsonb)) n on n.key = o.key
+  where o.key not in ('_form', 'where_when')
+    and btrim(o.value) <> '' and btrim(n.value) <> ''
+    and position(lower(btrim(o.value)) in lower(n.value)) = 0
+    and position(lower(btrim(n.value)) in lower(o.value)) = 0;
+$$;
+
+-- ---------------------------------------------------------
+-- 4. BEFORE trigger: dispute status + approval block
+-- ---------------------------------------------------------
+create or replace function public.claims_dispute_guard()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_new_attempt boolean := tg_op = 'INSERT' or new.claim_attempt_count > old.claim_attempt_count;
+begin
+  if v_new_attempt
+     and new.status in ('pending', 'needs_review', 'likely_owner', 'verified')
+     and exists (
+       select 1 from public.claims c
+       where c.found_item_id = new.found_item_id and c.id <> new.id
+         and c.status in ('pending', 'needs_review', 'likely_owner', 'verified', 'disputed')
+     ) then
+    new.status := 'disputed';
+  end if;
+
+  if new.status = 'approved' and (tg_op = 'INSERT' or old.status is distinct from 'approved')
+     and exists (
+       select 1 from public.claims c
+       where c.found_item_id = new.found_item_id and c.id <> new.id
+         and c.status in ('pending', 'needs_review', 'likely_owner', 'verified', 'disputed')
+     ) then
+    raise exception 'CLAIM_DISPUTED: other active claims exist for this item' using errcode = 'check_violation';
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_claims_dispute_guard on public.claims;
+create trigger trg_claims_dispute_guard
+  before insert or update on public.claims
+  for each row execute function public.claims_dispute_guard();
+
+-- ---------------------------------------------------------
+-- 5. AFTER trigger: spread dispute + risk signals
+-- ---------------------------------------------------------
+create or replace function public.claims_after_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_new_attempt boolean := tg_op = 'INSERT' or new.claim_attempt_count > old.claim_attempt_count;
+  v_count int;
+  v_changed text[];
+  v_created timestamptz;
+begin
+  -- ---- dispute ----
+  if v_new_attempt and new.status = 'disputed' then
+    update public.claims
+    set status = 'disputed'
+    where found_item_id = new.found_item_id and id <> new.id
+      and status in ('pending', 'needs_review', 'likely_owner', 'verified');
+
+    select count(*) into v_count from public.claims
+    where found_item_id = new.found_item_id and status = 'disputed';
+
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (auth.uid(), 'claim.disputed', 'found_item', new.found_item_id,
+            jsonb_build_object('active_claims', v_count, 'trigger_claim_id', new.id));
+
+    insert into public.notifications (user_id, type, title, message, payload)
+    select p.id, 'dispute_review_required', 'มีข้อพิพาทรอตรวจสอบ',
+           'สิ่งของ 1 รายการมีผู้ขอรับมากกว่า 1 คน — ระงับการอนุมัติไว้จนกว่าเจ้าหน้าที่จะตรวจสอบ',
+           jsonb_build_object('found_item_id', new.found_item_id)
+    from public.profiles p
+    where p.role in ('staff', 'admin') and p.id <> new.claimant_id;
+  end if;
+
+  -- ---- risk signals on a new attempt ----
+  if v_new_attempt then
+    if new.verification_level = 'enhanced' then
+      select created_at into v_created from public.profiles where id = new.claimant_id;
+      if v_created > now() - interval '7 days' then
+        perform public.raise_risk_event('new_account_high_value', 'medium', new.claimant_id, new.found_item_id, new.id,
+          jsonb_build_object('account_age_days', floor(extract(epoch from now() - v_created) / 86400)));
+      end if;
+    end if;
+
+    if tg_op = 'INSERT' then
+      select count(*) into v_count from public.claims
+      where claimant_id = new.claimant_id and created_at > now() - interval '7 days';
+      if v_count >= 5 then
+        perform public.raise_risk_event('frequent_claims',
+          case when v_count >= 8 then 'high'::public.risk_level_enum else 'medium'::public.risk_level_enum end,
+          new.claimant_id, null, null, jsonb_build_object('claims_7d', v_count));
+      end if;
+    else
+      perform public.raise_risk_event('duplicate_claim_target',
+        case when new.claim_attempt_count >= 3 then 'medium'::public.risk_level_enum else 'low'::public.risk_level_enum end,
+        new.claimant_id, new.found_item_id, new.id, jsonb_build_object('attempt', new.claim_attempt_count));
+
+      v_changed := public.contradicted_answer_keys(old.answers, new.answers);
+      if array_length(v_changed, 1) >= 2 then
+        -- field NAMES only, never the answer text
+        perform public.raise_risk_event('answer_changed', 'medium', new.claimant_id, new.found_item_id, new.id,
+          jsonb_build_object('changed_fields', to_jsonb(v_changed), 'attempt', new.claim_attempt_count));
+      end if;
+    end if;
+  end if;
+
+  -- ---- risk signal on a negative outcome ----
+  if tg_op = 'UPDATE' and new.status in ('rejected', 'insufficient') and old.status is distinct from new.status then
+    -- review_claim() updates the claim BEFORE inserting its claim_reviews row,
+    -- so count past reviews + this outcome.
+    select count(*) + 1 into v_count
+    from public.claim_reviews r
+    join public.claims c on c.id = r.claim_id
+    where c.claimant_id = new.claimant_id
+      and r.outcome in ('rejected', 'insufficient')
+      and r.created_at > now() - interval '30 days';
+    if v_count >= 3 then
+      perform public.raise_risk_event('repeated_rejections',
+        case when v_count >= 5 then 'high'::public.risk_level_enum else 'medium'::public.risk_level_enum end,
+        new.claimant_id, null, null, jsonb_build_object('negative_outcomes_30d', v_count));
+    end if;
+  end if;
+
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_claims_after_change on public.claims;
+create trigger trg_claims_after_change
+  after insert or update on public.claims
+  for each row execute function public.claims_after_change();
+
+-- ---------------------------------------------------------
+-- 6. Claimant may withdraw from a dispute as well
+-- ---------------------------------------------------------
+create or replace function public.cancel_claim(p_claim_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_claim public.claims%rowtype;
+begin
+  select * into v_claim from public.claims where id = p_claim_id for update;
+  if not found or v_claim.claimant_id is distinct from uid then
+    raise exception 'CLAIM_NOT_ALLOWED: not your claim' using errcode = 'insufficient_privilege';
+  end if;
+  if v_claim.status not in ('pending', 'needs_review', 'insufficient', 'disputed') then
+    raise exception 'CLAIM_NOT_ALLOWED: claim can no longer be cancelled' using errcode = 'check_violation';
+  end if;
+
+  update public.claims set status = 'cancelled' where id = p_claim_id;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'claim.cancelled', 'claim', p_claim_id, jsonb_build_object('from_status', v_claim.status));
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 7. resolve_risk_event (staff) — neutral outcomes only
+-- ---------------------------------------------------------
+create or replace function public.resolve_risk_event(
+  p_event_id uuid,
+  p_resolution text,
+  p_note text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_user uuid;
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'RISK_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_resolution not in ('needs_review', 'suspicious_activity', 'cleared') then
+    raise exception 'RISK_INVALID: resolution' using errcode = 'check_violation';
+  end if;
+
+  select related_user_id into v_user from public.risk_events where id = p_event_id;
+  if not found then
+    raise exception 'RISK_INVALID: event not found' using errcode = 'check_violation';
+  end if;
+  if v_user = uid then
+    raise exception 'RISK_CONFLICT: cannot resolve an event about yourself' using errcode = 'insufficient_privilege';
+  end if;
+
+  update public.risk_events
+  set resolution = p_resolution,
+      resolution_note = nullif(btrim(coalesce(p_note, '')), ''),
+      -- 'needs_review' keeps the event open; the other two close it
+      resolved_by = case when p_resolution = 'needs_review' then null else uid end,
+      resolved_at = case when p_resolution = 'needs_review' then null else now() end
+  where id = p_event_id;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'risk.resolved', 'risk_event', p_event_id, jsonb_build_object('resolution', p_resolution));
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 8. set_account_restriction (admin only)
+-- ---------------------------------------------------------
+create or replace function public.set_account_restriction(
+  p_user_id uuid,
+  p_restricted boolean,
+  p_reason text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+begin
+  if not public.is_admin() then
+    raise exception 'RISK_FORBIDDEN: admin only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_user_id = uid then
+    raise exception 'RISK_CONFLICT: cannot restrict yourself' using errcode = 'insufficient_privilege';
+  end if;
+  if p_reason is not null and char_length(p_reason) > 1000 then
+    raise exception 'RISK_INVALID: reason too long' using errcode = 'check_violation';
+  end if;
+
+  update public.profiles set is_restricted = p_restricted where id = p_user_id;
+  if not found then
+    raise exception 'RISK_INVALID: user not found' using errcode = 'check_violation';
+  end if;
+
+  if p_restricted then
+    update public.risk_events
+    set resolution = 'account_restricted', resolution_note = coalesce(nullif(btrim(coalesce(p_reason, '')), ''), resolution_note),
+        resolved_by = uid, resolved_at = now()
+    where related_user_id = p_user_id and resolved_at is null;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, case when p_restricted then 'account.restricted' else 'account.unrestricted' end,
+          'user', p_user_id, '{}'::jsonb);  -- reason stays in risk_events (staff-only), not in the log
+
+  insert into public.notifications (user_id, type, title, message, payload)
+  values (p_user_id,
+          case when p_restricted then 'account_restricted' else 'account_unrestricted' end,
+          case when p_restricted then 'บัญชีของคุณถูกจำกัดสิทธิ์ชั่วคราว' else 'บัญชีของคุณกลับมาใช้งานได้ตามปกติ' end,
+          case when p_restricted
+               then 'บางฟังก์ชัน เช่น การแจ้งรายการและการขอรับของ จะใช้ไม่ได้ชั่วคราว หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่'
+               else 'คุณสามารถใช้งานระบบได้ตามปกติแล้ว' end,
+          '{}'::jsonb);
+end;
+$$;
+
+revoke all on function public.resolve_risk_event(uuid, text, text) from public, anon;
+revoke all on function public.set_account_restriction(uuid, boolean, text) from public, anon;
+revoke all on function public.cancel_claim(uuid) from public, anon;
+grant execute on function public.resolve_risk_event(uuid, text, text) to authenticated;
+grant execute on function public.set_account_restriction(uuid, boolean, text) to authenticated;
+grant execute on function public.cancel_claim(uuid) to authenticated;
+revoke all on function public.contradicted_answer_keys(jsonb, jsonb) from public, anon, authenticated;
+
+-- ---------- migrations/0023_phase8_custody_handover.sql ----------
+-- =========================================================
+-- 0023_phase8_custody_handover.sql
+-- Phase 8 — Custody + Secure Handover
+--
+--   record_custody_transfer(found_item_id, to_status, location_id, note)  staff
+--   issue_handover_code(claim_id) -> 6-digit code (shown once)             approved claimant
+--   my_handover_info(claim_id)                                             approved claimant
+--   complete_handover(claim_id, code, location_id, id_checked, id_doc, note) -> status text   staff
+--
+-- Security decisions:
+--   * handover_codes is no longer readable by ANYONE through the API
+--     (Phase 1 let staff SELECT code_hash; a 6-digit code has only 10^6
+--     values, so a readable hash can be brute-forced offline). Codes are
+--     checked only inside complete_handover().
+--   * codes: crypto-random (gen_random_bytes), stored as bcrypt hash,
+--     valid 48h, single use, 5 wrong entries -> code locked, max 5 issues
+--     per claim. A wrong code returns a status (not an exception) so the
+--     failed-attempt counter is actually saved.
+--   * handover only for an APPROVED claim with no other active claim
+--     (dispute), item must be in staff custody (transferred_to_staff /
+--     in_storage), handled at an active handover location.
+--   * enhanced (high-value) claims: staff must confirm the receiver's ID
+--     document. Only the document TYPE is stored, never its number.
+--   * staff who are the claimant or the finder cannot hand over.
+--   * every custody move is recorded in custody_history (append-only for
+--     clients) with who / where / when.
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1. handover_locations: validation (admin manages via existing policy)
+-- ---------------------------------------------------------
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'handover_locations_name_len') then
+    alter table public.handover_locations add constraint handover_locations_name_len
+      check (char_length(btrim(name)) between 1 and 120) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'handover_locations_address_len') then
+    alter table public.handover_locations add constraint handover_locations_address_len
+      check (address is null or char_length(address) <= 300) not valid;
+  end if;
+end $$;
+-- Deactivate instead of delete: custody_history keeps pointing at old locations.
+revoke delete on public.handover_locations from anon, authenticated;
+
+-- ---------------------------------------------------------
+-- 2. handover_codes: fully server-side
+-- ---------------------------------------------------------
+alter table public.handover_codes add column if not exists failed_attempts int not null default 0;
+alter table public.handover_codes add column if not exists issue_count int not null default 0;
+
+drop policy if exists handover_codes_select_staff on public.handover_codes;
+drop policy if exists handover_codes_update_staff on public.handover_codes;
+revoke all on public.handover_codes from anon, authenticated;
+
+-- ---------------------------------------------------------
+-- 3. handovers: the confirmation record
+-- ---------------------------------------------------------
+create table if not exists public.handovers (
+  id                uuid primary key default gen_random_uuid(),
+  claim_id          uuid not null unique references public.claims(id),
+  found_item_id     uuid not null references public.found_items(id),
+  handed_over_by    uuid not null references public.profiles(id),   -- staff at the counter
+  received_by       uuid not null references public.profiles(id),   -- the approved claimant
+  location_id       uuid not null references public.handover_locations(id),
+  id_checked        boolean not null default false,
+  id_document_type  text check (id_document_type is null or id_document_type in ('student_card', 'staff_card', 'national_id', 'passport', 'driver_license', 'other')),
+  note              text check (note is null or char_length(note) <= 1000),
+  created_at        timestamptz not null default now()
+);
+
+alter table public.handovers enable row level security;
+
+drop policy if exists handovers_select_staff on public.handovers;
+create policy handovers_select_staff on public.handovers for select using (public.is_staff_or_admin());
+drop policy if exists handovers_select_receiver on public.handovers;
+create policy handovers_select_receiver on public.handovers for select using (received_by = auth.uid());
+
+revoke insert, update, delete on public.handovers from anon, authenticated;
+revoke all on public.handovers from anon;
+
+-- custody_history: clients read via existing policies, never write
+revoke insert, update, delete on public.custody_history from anon, authenticated;
+revoke all on public.custody_history from anon;
+create index if not exists idx_custody_history_item on public.custody_history (found_item_id, created_at);
+
+-- ---------------------------------------------------------
+-- 4. record_custody_transfer (staff)
+-- ---------------------------------------------------------
+create or replace function public.record_custody_transfer(
+  p_found_item_id uuid,
+  p_to_status public.custody_status_enum,
+  p_location_id uuid,
+  p_note text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_item public.found_items%rowtype;
+  v_claimant uuid;
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'CUSTODY_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_to_status = 'released_to_owner' then
+    raise exception 'CUSTODY_INVALID: release only through complete_handover' using errcode = 'check_violation';
+  end if;
+  if p_to_status = 'with_finder' then
+    raise exception 'CUSTODY_INVALID: cannot move back to finder' using errcode = 'check_violation';
+  end if;
+  if p_note is not null and char_length(p_note) > 1000 then
+    raise exception 'CUSTODY_INVALID: note too long' using errcode = 'check_violation';
+  end if;
+  if not exists (select 1 from public.handover_locations where id = p_location_id and is_active) then
+    raise exception 'CUSTODY_INVALID: location must be an active handover location' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.found_items where id = p_found_item_id for update;
+  if not found then
+    raise exception 'CUSTODY_INVALID: item not found' using errcode = 'check_violation';
+  end if;
+  if v_item.custody_status = 'released_to_owner' or v_item.status in ('returned', 'closed') then
+    raise exception 'CUSTODY_INVALID: item already returned/closed' using errcode = 'check_violation';
+  end if;
+
+  update public.found_items
+  set custody_status = p_to_status,
+      status = case when status = 'reported' then 'in_custody'::public.found_item_status_enum else status end
+  where id = p_found_item_id;
+
+  insert into public.custody_history (found_item_id, from_status, to_status, handled_by, location_id, notes)
+  values (p_found_item_id, v_item.custody_status, p_to_status, uid, p_location_id, nullif(btrim(coalesce(p_note, '')), ''));
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'custody.changed', 'found_item', p_found_item_id,
+          jsonb_build_object('from', v_item.custody_status, 'to', p_to_status, 'location_id', p_location_id));
+
+  -- If an approved claim is waiting, tell the claimant the item is ready.
+  select c.claimant_id into v_claimant from public.claims c
+  where c.found_item_id = p_found_item_id and c.status = 'approved'
+    and not exists (select 1 from public.handovers h where h.claim_id = c.id)
+  limit 1;
+  if v_claimant is not null and v_item.custody_status = 'with_finder' then
+    insert into public.notifications (user_id, type, title, message, payload)
+    select v_claimant, 'handover_ready', 'ของพร้อมให้รับแล้ว',
+           'กรุณาเปิดหน้าคำขอรับของเพื่อดูสถานที่รับของ และขอรหัสรับของเมื่อพร้อมไปรับ',
+           jsonb_build_object('claim_id', c.id)
+    from public.claims c where c.found_item_id = p_found_item_id and c.status = 'approved' limit 1;
+  end if;
+end;
+$$;
+
+-- Approved while the item is already with staff -> claimant is ready to pick up.
+create or replace function public.claims_handover_ready()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.status = 'approved' and old.status is distinct from 'approved'
+     and exists (select 1 from public.found_items fi where fi.id = new.found_item_id
+                 and fi.custody_status in ('transferred_to_staff', 'in_storage')) then
+    insert into public.notifications (user_id, type, title, message, payload)
+    values (new.claimant_id, 'handover_ready', 'ของพร้อมให้รับแล้ว',
+            'กรุณาเปิดหน้าคำขอรับของเพื่อดูสถานที่รับของ และขอรหัสรับของเมื่อพร้อมไปรับ',
+            jsonb_build_object('claim_id', new.id));
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_claims_handover_ready on public.claims;
+create trigger trg_claims_handover_ready
+  after update on public.claims
+  for each row execute function public.claims_handover_ready();
+
+-- ---------------------------------------------------------
+-- 5. Where to pick up (claimant view, no custody internals)
+-- ---------------------------------------------------------
+create or replace function public.my_handover_info(p_claim_id uuid)
+returns table (
+  ready boolean,
+  completed boolean,
+  location_name text,
+  location_address text,
+  code_active boolean,
+  code_expires_at timestamptz,
+  codes_left int
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_claim public.claims%rowtype;
+  v_custody public.custody_status_enum;
+  v_loc uuid;
+  v_code public.handover_codes%rowtype;
+begin
+  select * into v_claim from public.claims where id = p_claim_id;
+  if not found or v_claim.claimant_id is distinct from uid or v_claim.status <> 'approved' then
+    return;  -- nothing for anyone else
+  end if;
+
+  select custody_status into v_custody from public.found_items where id = v_claim.found_item_id;
+  select location_id into v_loc from public.custody_history
+  where found_item_id = v_claim.found_item_id and location_id is not null
+  order by created_at desc limit 1;
+  select * into v_code from public.handover_codes where claim_id = p_claim_id;
+
+  return query
+  select
+    v_custody in ('transferred_to_staff', 'in_storage'),
+    exists (select 1 from public.handovers h where h.claim_id = p_claim_id),
+    hl.name,
+    hl.address,
+    v_code.id is not null and v_code.used_at is null and v_code.expires_at > now() and v_code.failed_attempts < 5,
+    case when v_code.used_at is null then v_code.expires_at end,
+    5 - coalesce(v_code.issue_count, 0)
+  from (select 1) dummy
+  left join public.handover_locations hl on hl.id = v_loc;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 6. issue_handover_code (approved claimant) -> plaintext code ONCE
+-- ---------------------------------------------------------
+create or replace function public.issue_handover_code(p_claim_id uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  uid uuid := auth.uid();
+  v_claim public.claims%rowtype;
+  v_custody public.custody_status_enum;
+  v_issued int;
+  v_code text;
+begin
+  select * into v_claim from public.claims where id = p_claim_id for update;
+  if not found or v_claim.claimant_id is distinct from uid then
+    raise exception 'HANDOVER_FORBIDDEN: not your claim' using errcode = 'insufficient_privilege';
+  end if;
+  if v_claim.status <> 'approved' then
+    raise exception 'HANDOVER_NOT_READY: claim not approved' using errcode = 'check_violation';
+  end if;
+  if exists (select 1 from public.handovers where claim_id = p_claim_id) then
+    raise exception 'HANDOVER_DONE: already handed over' using errcode = 'check_violation';
+  end if;
+  select custody_status into v_custody from public.found_items where id = v_claim.found_item_id;
+  if v_custody not in ('transferred_to_staff', 'in_storage') then
+    raise exception 'HANDOVER_NOT_READY: item not yet with staff' using errcode = 'check_violation';
+  end if;
+
+  select issue_count into v_issued from public.handover_codes where claim_id = p_claim_id;
+  if coalesce(v_issued, 0) >= 5 then
+    raise exception 'HANDOVER_LOCKED: too many codes issued' using errcode = 'check_violation';
+  end if;
+
+  -- 6 digits from a CSPRNG (random() is not suitable for secrets)
+  v_code := lpad(((('x' || encode(gen_random_bytes(4), 'hex'))::bit(32)::bigint) % 1000000)::text, 6, '0');
+
+  insert into public.handover_codes (claim_id, code_hash, expires_at, used_at, used_by, failed_attempts, issue_count)
+  values (p_claim_id, crypt(v_code, gen_salt('bf', 8)), now() + interval '48 hours', null, null, 0, 1)
+  on conflict (claim_id) do update
+  set code_hash = excluded.code_hash,
+      expires_at = excluded.expires_at,
+      used_at = null,
+      used_by = null,
+      failed_attempts = 0,
+      issue_count = public.handover_codes.issue_count + 1,
+      created_at = now();
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'handover.code_issued', 'claim', p_claim_id, jsonb_build_object('issue', coalesce(v_issued, 0) + 1));
+
+  return v_code;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 7. complete_handover (staff) -> 'completed' | 'invalid_code' | 'expired' | 'locked' | 'no_code'
+-- ---------------------------------------------------------
+create or replace function public.complete_handover(
+  p_claim_id uuid,
+  p_code text,
+  p_location_id uuid,
+  p_id_checked boolean default false,
+  p_id_document_type text default null,
+  p_note text default null
+)
+returns text
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  uid uuid := auth.uid();
+  v_claim public.claims%rowtype;
+  v_item public.found_items%rowtype;
+  v_code public.handover_codes%rowtype;
+  v_lost uuid;
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'HANDOVER_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_claim from public.claims where id = p_claim_id for update;
+  if not found or v_claim.status <> 'approved' then
+    raise exception 'HANDOVER_NOT_READY: claim not approved' using errcode = 'check_violation';
+  end if;
+  if exists (select 1 from public.handovers where claim_id = p_claim_id) then
+    raise exception 'HANDOVER_DONE: already handed over' using errcode = 'check_violation';
+  end if;
+  if exists (select 1 from public.claims c where c.found_item_id = v_claim.found_item_id and c.id <> p_claim_id
+             and c.status in ('pending', 'needs_review', 'likely_owner', 'verified', 'disputed')) then
+    raise exception 'HANDOVER_DISPUTED: other active claims exist' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.found_items where id = v_claim.found_item_id for update;
+  if uid = v_claim.claimant_id or uid = v_item.finder_id then
+    raise exception 'HANDOVER_CONFLICT: staff involved in this item' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.custody_status not in ('transferred_to_staff', 'in_storage') then
+    raise exception 'HANDOVER_NOT_READY: item not in staff custody' using errcode = 'check_violation';
+  end if;
+  if not exists (select 1 from public.handover_locations where id = p_location_id and is_active) then
+    raise exception 'HANDOVER_INVALID: location' using errcode = 'check_violation';
+  end if;
+  if v_claim.verification_level = 'enhanced' and (not coalesce(p_id_checked, false) or p_id_document_type is null) then
+    raise exception 'HANDOVER_ID_REQUIRED: enhanced items require ID check' using errcode = 'check_violation';
+  end if;
+  if p_id_document_type is not null and p_id_document_type not in
+     ('student_card', 'staff_card', 'national_id', 'passport', 'driver_license', 'other') then
+    raise exception 'HANDOVER_INVALID: id document type' using errcode = 'check_violation';
+  end if;
+  if p_note is not null and char_length(p_note) > 1000 then
+    raise exception 'HANDOVER_INVALID: note too long' using errcode = 'check_violation';
+  end if;
+
+  -- ---- code check (returns a status so failed attempts are persisted) ----
+  select * into v_code from public.handover_codes where claim_id = p_claim_id for update;
+  if not found then
+    return 'no_code';
+  end if;
+  if v_code.used_at is not null or v_code.failed_attempts >= 5 then
+    return 'locked';
+  end if;
+  if v_code.expires_at <= now() then
+    return 'expired';
+  end if;
+  if p_code is null or p_code !~ '^\d{6}$' or crypt(p_code, v_code.code_hash) <> v_code.code_hash then
+    update public.handover_codes set failed_attempts = failed_attempts + 1 where id = v_code.id;
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (uid, 'handover.code_failed', 'claim', p_claim_id, jsonb_build_object('attempt', v_code.failed_attempts + 1));
+    return case when v_code.failed_attempts + 1 >= 5 then 'locked' else 'invalid_code' end;
+  end if;
+
+  -- ---- success ----
+  update public.handover_codes set used_at = now(), used_by = uid where id = v_code.id;
+
+  insert into public.handovers (claim_id, found_item_id, handed_over_by, received_by, location_id,
+                                id_checked, id_document_type, note)
+  values (p_claim_id, v_item.id, uid, v_claim.claimant_id, p_location_id,
+          coalesce(p_id_checked, false), p_id_document_type, nullif(btrim(coalesce(p_note, '')), ''));
+
+  update public.found_items set custody_status = 'released_to_owner', status = 'returned' where id = v_item.id;
+
+  insert into public.custody_history (found_item_id, from_status, to_status, handled_by, location_id, notes)
+  values (v_item.id, v_item.custody_status, 'released_to_owner', uid, p_location_id, 'ส่งมอบให้ผู้ขอรับที่ผ่านการตรวจสอบ');
+
+  -- the claimant's own lost report (if linked) is closed as returned
+  select m.lost_item_id into v_lost from public.matches m where m.id = v_claim.match_id;
+  if v_lost is not null then
+    update public.lost_items set status = 'returned' where id = v_lost and reporter_id = v_claim.claimant_id;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'handover.completed', 'claim', p_claim_id, jsonb_build_object(
+    'found_item_id', v_item.id, 'location_id', p_location_id, 'id_checked', coalesce(p_id_checked, false),
+    'verification_level', v_claim.verification_level));
+
+  insert into public.notifications (user_id, type, title, message, payload) values
+    (v_claim.claimant_id, 'handover_completed', 'รับของคืนเรียบร้อย',
+     'บันทึกการรับของคืนเรียบร้อยแล้ว ขอบคุณที่ใช้ระบบ', jsonb_build_object('claim_id', p_claim_id)),
+    (v_item.finder_id, 'item_returned', 'ของที่คุณแจ้งพบได้คืนเจ้าของแล้ว',
+     'ขอบคุณที่ช่วยส่งคืนของให้เจ้าของ', jsonb_build_object('found_item_id', v_item.id));
+
+  return 'completed';
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 8. Function privileges
+-- ---------------------------------------------------------
+revoke all on function public.record_custody_transfer(uuid, public.custody_status_enum, uuid, text) from public, anon;
+revoke all on function public.my_handover_info(uuid) from public, anon;
+revoke all on function public.issue_handover_code(uuid) from public, anon;
+revoke all on function public.complete_handover(uuid, text, uuid, boolean, text, text) from public, anon;
+grant execute on function public.record_custody_transfer(uuid, public.custody_status_enum, uuid, text) to authenticated;
+grant execute on function public.my_handover_info(uuid) to authenticated;
+grant execute on function public.issue_handover_code(uuid) to authenticated;
+grant execute on function public.complete_handover(uuid, text, uuid, boolean, text, text) to authenticated;
+
+-- ---------- migrations/0024_phase9_notifications_audit.sql ----------
+-- =========================================================
+-- 0024_phase9_notifications_audit.sql
+-- Phase 9 — Notifications + Audit
+--
+-- NOTIFICATIONS
+--   * claim_received: the claimant gets a confirmation for every
+--     submission / re-submission (other README types already exist:
+--     potential_match, claim_more_info, claim_approved, claim_rejected,
+--     handover_ready, handover_completed, claim_review_required,
+--     dispute_review_required).
+--   * DB guard: a notification is REJECTED if its payload carries a
+--     forbidden key (secret_details, serial_number, answers, code, ...)
+--     or if its title/message/payload contains the secret details,
+--     serial number or exact location of any found item it refers to
+--     (or the private ownership details of a lost item it refers to).
+--     This makes "notifications never reveal secret_details" a database
+--     guarantee, not just a coding convention.
+--
+-- AUDIT
+--   * audit_logs is now immutable for EVERYONE, including the table owner
+--     and the service role: UPDATE / DELETE / TRUNCATE raise an error.
+--   * new events:
+--       lost_item.edited / found_item.edited  (changed field NAMES only;
+--         lifecycle-only changes are covered by their own events)
+--       profile.role_changed / profile.restriction_changed /
+--         profile.password_flag_changed
+--       reference.created / reference.updated / reference.deleted
+--         (categories, locations, handover_locations)
+--       internal_note.created / internal_note.deleted
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 0. helper
+-- ---------------------------------------------------------
+create or replace function public.try_uuid(p text)
+returns uuid
+language sql
+immutable
+as $$
+  select case when p ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then p::uuid end;
+$$;
+
+-- ---------------------------------------------------------
+-- 1. Notification content guard
+-- ---------------------------------------------------------
+create or replace function public.guard_notification_content()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_text text := lower(coalesce(new.title, '') || ' ' || coalesce(new.message, '') || ' ' || coalesce(new.payload::text, ''));
+  v_alnum text := regexp_replace(v_text, '[^a-z0-9]', '', 'g');
+  v_found uuid[] := '{}';
+  v_lost uuid[] := '{}';
+  r record;
+begin
+  if new.payload is not null and jsonb_typeof(new.payload) = 'object'
+     and new.payload ?| array['secret_details', 'serial_number', 'exact_location', 'exact_time',
+                              'private_image_url', 'private_ownership_details', 'answers',
+                              'code', 'code_hash', 'evidence_url', 'finder_id', 'claimant_id'] then
+    raise exception 'NOTIFY_FORBIDDEN: payload contains a private field' using errcode = 'check_violation';
+  end if;
+
+  -- found items referenced directly, via a list, or via a claim
+  v_found := array_remove(array[public.try_uuid(new.payload->>'found_item_id')], null);
+  if jsonb_typeof(new.payload->'found_item_ids') = 'array' then
+    v_found := v_found || array(select public.try_uuid(x) from jsonb_array_elements_text(new.payload->'found_item_ids') x
+                                 where public.try_uuid(x) is not null);
+  end if;
+  if public.try_uuid(new.payload->>'claim_id') is not null then
+    v_found := v_found || array(select found_item_id from public.claims where id = public.try_uuid(new.payload->>'claim_id'));
+  end if;
+  v_lost := array_remove(array[public.try_uuid(new.payload->>'lost_item_id')], null);
+
+  for r in select secret_details, serial_number, exact_location from public.found_items where id = any(v_found) loop
+    if (char_length(btrim(coalesce(r.secret_details, ''))) >= 4 and position(lower(btrim(r.secret_details)) in v_text) > 0)
+       or (char_length(btrim(coalesce(r.exact_location, ''))) >= 4 and position(lower(btrim(r.exact_location)) in v_text) > 0)
+       or (char_length(regexp_replace(lower(coalesce(r.serial_number, '')), '[^a-z0-9]', '', 'g')) >= 4
+           and position(regexp_replace(lower(r.serial_number), '[^a-z0-9]', '', 'g') in v_alnum) > 0) then
+      raise exception 'NOTIFY_LEAK: notification would reveal found-item secrets' using errcode = 'check_violation';
+    end if;
+  end loop;
+
+  for r in select private_ownership_details from public.lost_items where id = any(v_lost) loop
+    if char_length(btrim(coalesce(r.private_ownership_details, ''))) >= 4
+       and position(lower(btrim(r.private_ownership_details)) in v_text) > 0 then
+      raise exception 'NOTIFY_LEAK: notification would reveal private ownership details' using errcode = 'check_violation';
+    end if;
+  end loop;
+
+  if char_length(coalesce(new.title, '')) > 200 or char_length(coalesce(new.message, '')) > 1000 then
+    raise exception 'NOTIFY_INVALID: too long' using errcode = 'check_violation';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_notifications_guard on public.notifications;
+create trigger trg_notifications_guard
+  before insert or update on public.notifications
+  for each row execute function public.guard_notification_content();
+
+-- ---------------------------------------------------------
+-- 2. claim_received confirmation
+-- ---------------------------------------------------------
+create or replace function public.claims_notify_received()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op = 'INSERT' or new.claim_attempt_count > old.claim_attempt_count then
+    insert into public.notifications (user_id, type, title, message, payload)
+    values (new.claimant_id, 'claim_received', 'ได้รับคำขอรับของแล้ว',
+            'เจ้าหน้าที่จะตรวจสอบข้อมูลและแจ้งผลให้ทราบผ่านหน้าการแจ้งเตือน',
+            jsonb_build_object('claim_id', new.id));
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_claims_notify_received on public.claims;
+create trigger trg_claims_notify_received
+  after insert or update on public.claims
+  for each row execute function public.claims_notify_received();
+
+-- ---------------------------------------------------------
+-- 3. audit_logs: immutable for everyone
+-- ---------------------------------------------------------
+create or replace function public.audit_logs_immutable()
+returns trigger
+language plpgsql
+as $$
+begin
+  raise exception 'AUDIT_IMMUTABLE: audit_logs cannot be modified or deleted' using errcode = 'insufficient_privilege';
+end;
+$$;
+
+drop trigger if exists trg_audit_logs_no_update on public.audit_logs;
+create trigger trg_audit_logs_no_update
+  before update or delete on public.audit_logs
+  for each row execute function public.audit_logs_immutable();
+
+drop trigger if exists trg_audit_logs_no_truncate on public.audit_logs;
+create trigger trg_audit_logs_no_truncate
+  before truncate on public.audit_logs
+  for each statement execute function public.audit_logs_immutable();
+
+revoke insert, update, delete, truncate on public.audit_logs from anon, authenticated;
+revoke all on public.audit_logs from anon;
+
+create index if not exists idx_audit_logs_created on public.audit_logs (created_at desc);
+create index if not exists idx_audit_logs_entity on public.audit_logs (entity_type, entity_id, created_at desc);
+create index if not exists idx_audit_logs_actor on public.audit_logs (actor_id, created_at desc);
+create index if not exists idx_audit_logs_action on public.audit_logs (action, created_at desc);
+
+-- ---------------------------------------------------------
+-- 4. Item edits (field NAMES only — never values of private fields)
+-- ---------------------------------------------------------
+create or replace function public.audit_item_edit()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_changed text[];
+begin
+  select coalesce(array_agg(n.key order by n.key), '{}') into v_changed
+  from jsonb_each(to_jsonb(new)) n
+  join jsonb_each(to_jsonb(old)) o on o.key = n.key
+  where n.value is distinct from o.value
+    and n.key not in ('updated_at');
+
+  -- Pure lifecycle changes (status / custody) have their own events
+  -- (claim.reviewed, custody.changed, handover.completed).
+  if v_changed <@ array['status', 'custody_status'] then
+    return null;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (auth.uid(),
+          case tg_table_name when 'lost_items' then 'lost_item.edited' else 'found_item.edited' end,
+          case tg_table_name when 'lost_items' then 'lost_item' else 'found_item' end,
+          new.id,
+          jsonb_build_object('changed_fields', to_jsonb(v_changed)));
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_lost_items_audit_edit on public.lost_items;
+create trigger trg_lost_items_audit_edit
+  after update on public.lost_items
+  for each row execute function public.audit_item_edit();
+
+drop trigger if exists trg_found_items_audit_edit on public.found_items;
+create trigger trg_found_items_audit_edit
+  after update on public.found_items
+  for each row execute function public.audit_item_edit();
+
+-- ---------------------------------------------------------
+-- 5. Profile admin changes
+-- ---------------------------------------------------------
+create or replace function public.audit_profile_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if new.role is distinct from old.role then
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (auth.uid(), 'profile.role_changed', 'user', new.id,
+            jsonb_build_object('from', old.role, 'to', new.role));
+  end if;
+  -- set_account_restriction() writes its own account.restricted event
+  if new.is_restricted is distinct from old.is_restricted
+     and coalesce(current_setting('cdti.audit_skip_restriction', true), '') <> 'on' then
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (auth.uid(), 'profile.restriction_changed', 'user', new.id,
+            jsonb_build_object('restricted', new.is_restricted));
+  end if;
+  if new.must_change_password is distinct from old.must_change_password then
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (auth.uid(), 'profile.password_flag_changed', 'user', new.id,
+            jsonb_build_object('must_change_password', new.must_change_password));
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_profiles_audit on public.profiles;
+create trigger trg_profiles_audit
+  after update on public.profiles
+  for each row execute function public.audit_profile_change();
+
+-- set_account_restriction(): mark its own update so the generic trigger
+-- does not log the same restriction twice. (Body identical to 0022 plus
+-- the set_config line.)
+create or replace function public.set_account_restriction(
+  p_user_id uuid,
+  p_restricted boolean,
+  p_reason text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_rows int;
+begin
+  if not public.is_admin() then
+    raise exception 'RISK_FORBIDDEN: admin only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_user_id = uid then
+    raise exception 'RISK_CONFLICT: cannot restrict yourself' using errcode = 'insufficient_privilege';
+  end if;
+  if p_reason is not null and char_length(p_reason) > 1000 then
+    raise exception 'RISK_INVALID: reason too long' using errcode = 'check_violation';
+  end if;
+
+  perform set_config('cdti.audit_skip_restriction', 'on', true);
+  update public.profiles set is_restricted = p_restricted where id = p_user_id;
+  get diagnostics v_rows = row_count;
+  perform set_config('cdti.audit_skip_restriction', 'off', true);
+  if v_rows = 0 then
+    raise exception 'RISK_INVALID: user not found' using errcode = 'check_violation';
+  end if;
+
+  if p_restricted then
+    update public.risk_events
+    set resolution = 'account_restricted', resolution_note = coalesce(nullif(btrim(coalesce(p_reason, '')), ''), resolution_note),
+        resolved_by = uid, resolved_at = now()
+    where related_user_id = p_user_id and resolved_at is null;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, case when p_restricted then 'account.restricted' else 'account.unrestricted' end,
+          'user', p_user_id, '{}'::jsonb);
+
+  insert into public.notifications (user_id, type, title, message, payload)
+  values (p_user_id,
+          case when p_restricted then 'account_restricted' else 'account_unrestricted' end,
+          case when p_restricted then 'บัญชีของคุณถูกจำกัดสิทธิ์ชั่วคราว' else 'บัญชีของคุณกลับมาใช้งานได้ตามปกติ' end,
+          case when p_restricted
+               then 'บางฟังก์ชัน เช่น การแจ้งรายการและการขอรับของ จะใช้ไม่ได้ชั่วคราว หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่'
+               else 'คุณสามารถใช้งานระบบได้ตามปกติแล้ว' end,
+          '{}'::jsonb);
+end;
+$$;
+
+revoke all on function public.set_account_restriction(uuid, boolean, text) from public, anon;
+grant execute on function public.set_account_restriction(uuid, boolean, text) to authenticated;
+
+-- ---------------------------------------------------------
+-- 6. Reference data (admin actions)
+-- ---------------------------------------------------------
+create or replace function public.audit_reference_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_row jsonb := case when tg_op = 'DELETE' then to_jsonb(old) else to_jsonb(new) end;
+  v_changed text[];
+begin
+  if tg_op = 'UPDATE' then
+    select coalesce(array_agg(n.key order by n.key), '{}') into v_changed
+    from jsonb_each(to_jsonb(new)) n join jsonb_each(to_jsonb(old)) o on o.key = n.key
+    where n.value is distinct from o.value;
+  end if;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (auth.uid(),
+          'reference.' || case tg_op when 'INSERT' then 'created' when 'UPDATE' then 'updated' else 'deleted' end,
+          tg_table_name,
+          (v_row->>'id')::uuid,
+          jsonb_strip_nulls(jsonb_build_object(
+            'name', coalesce(v_row->>'name_th', v_row->>'name'),
+            'is_active', v_row->'is_active',
+            'changed_fields', to_jsonb(v_changed))));
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_categories_audit on public.categories;
+create trigger trg_categories_audit after insert or update or delete on public.categories
+  for each row execute function public.audit_reference_change();
+drop trigger if exists trg_locations_audit on public.locations;
+create trigger trg_locations_audit after insert or update or delete on public.locations
+  for each row execute function public.audit_reference_change();
+drop trigger if exists trg_handover_locations_audit on public.handover_locations;
+create trigger trg_handover_locations_audit after insert or update or delete on public.handover_locations
+  for each row execute function public.audit_reference_change();
+
+-- ---------------------------------------------------------
+-- 7. Internal notes (staff) — note text stays in internal_notes, not in the log
+-- ---------------------------------------------------------
+create or replace function public.audit_internal_note()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if tg_op = 'INSERT' then
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (auth.uid(), 'internal_note.created', new.entity_type, new.entity_id, jsonb_build_object('note_id', new.id));
+  else
+    insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+    values (auth.uid(), 'internal_note.deleted', old.entity_type, old.entity_id,
+            jsonb_build_object('note_id', old.id, 'author_id', old.author_id));
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists trg_internal_notes_audit on public.internal_notes;
+create trigger trg_internal_notes_audit after insert or delete on public.internal_notes
+  for each row execute function public.audit_internal_note();
+
+revoke all on function public.try_uuid(text) from public, anon;
+grant execute on function public.try_uuid(text) to authenticated;
+
+-- ---------- migrations/0025_phase10_admin_dashboard.sql ----------
+-- =========================================================
+-- 0025_phase10_admin_dashboard.sql
+-- Phase 10 — Admin Dashboard
+--
+--   admin_stats(from, to)          staff: aggregate statistics only (no per-person risk data)
+--   admin_custody_anomalies()      staff: custody / handover situations that need attention
+--   escalate_case(type, id, reason) staff: escalate a claim / risk event / found item to admins
+--   resolve_escalation(id, note)   admin: close an escalation
+--
+-- Also:
+--   * internal_notes: length + entity checks; only the AUTHOR or an ADMIN
+--     may delete a note (Phase 1 let any staff delete anyone's note).
+--   * categories / locations: name validation; delete revoked (deactivate
+--     instead) so existing reports keep their references. Admin writes stay
+--     governed by the Phase 1 *_write_admin RLS policies.
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1. Reference data validation
+-- ---------------------------------------------------------
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'categories_name_len') then
+    alter table public.categories add constraint categories_name_len
+      check (char_length(btrim(name_th)) between 1 and 80 and (name_en is null or char_length(name_en) <= 80)) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'locations_name_len') then
+    alter table public.locations add constraint locations_name_len
+      check (char_length(btrim(name)) between 1 and 120 and (description is null or char_length(description) <= 300)) not valid;
+  end if;
+end $$;
+revoke delete on public.categories, public.locations from anon, authenticated;
+
+-- ---------------------------------------------------------
+-- 2. Internal notes
+-- ---------------------------------------------------------
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'internal_notes_note_len') then
+    alter table public.internal_notes add constraint internal_notes_note_len
+      check (char_length(btrim(note)) between 1 and 2000) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'internal_notes_entity_type_check') then
+    alter table public.internal_notes add constraint internal_notes_entity_type_check
+      check (entity_type in ('claim', 'found_item', 'lost_item', 'risk_event', 'user', 'escalation')) not valid;
+  end if;
+end $$;
+
+drop policy if exists internal_notes_delete_staff on public.internal_notes;
+drop policy if exists internal_notes_delete_author_or_admin on public.internal_notes;
+create policy internal_notes_delete_author_or_admin
+  on public.internal_notes for delete
+  using (public.is_staff_or_admin() and (author_id = auth.uid() or public.is_admin()));
+
+revoke update on public.internal_notes from anon, authenticated;  -- notes are append-only (no edit)
+revoke all on public.internal_notes from anon;
+create index if not exists idx_internal_notes_entity on public.internal_notes (entity_type, entity_id, created_at);
+
+-- ---------------------------------------------------------
+-- 3. Escalations
+-- ---------------------------------------------------------
+create table if not exists public.case_escalations (
+  id               uuid primary key default gen_random_uuid(),
+  entity_type      text not null check (entity_type in ('claim', 'risk_event', 'found_item')),
+  entity_id        uuid not null,
+  reason           text not null check (char_length(btrim(reason)) between 5 and 1000),
+  escalated_by     uuid not null references public.profiles(id),
+  status           text not null default 'open' check (status in ('open', 'resolved')),
+  resolved_by      uuid references public.profiles(id),
+  resolved_at      timestamptz,
+  resolution_note  text check (resolution_note is null or char_length(resolution_note) <= 1000),
+  created_at       timestamptz not null default now()
+);
+
+alter table public.case_escalations enable row level security;
+drop policy if exists case_escalations_select_staff on public.case_escalations;
+create policy case_escalations_select_staff on public.case_escalations for select using (public.is_staff_or_admin());
+revoke insert, update, delete on public.case_escalations from anon, authenticated;
+revoke all on public.case_escalations from anon;
+create unique index if not exists uq_case_escalations_open
+  on public.case_escalations (entity_type, entity_id) where status = 'open';
+create index if not exists idx_case_escalations_status on public.case_escalations (status, created_at desc);
+
+create or replace function public.escalate_case(p_entity_type text, p_entity_id uuid, p_reason text)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_id uuid;
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'ESCALATE_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_entity_type not in ('claim', 'risk_event', 'found_item') then
+    raise exception 'ESCALATE_INVALID: entity type' using errcode = 'check_violation';
+  end if;
+  if char_length(btrim(coalesce(p_reason, ''))) not between 5 and 1000 then
+    raise exception 'ESCALATE_INVALID: reason must be 5-1000 characters' using errcode = 'check_violation';
+  end if;
+  if not (
+    (p_entity_type = 'claim' and exists (select 1 from public.claims where id = p_entity_id)) or
+    (p_entity_type = 'risk_event' and exists (select 1 from public.risk_events where id = p_entity_id)) or
+    (p_entity_type = 'found_item' and exists (select 1 from public.found_items where id = p_entity_id))
+  ) then
+    raise exception 'ESCALATE_INVALID: not found' using errcode = 'check_violation';
+  end if;
+  if exists (select 1 from public.case_escalations where entity_type = p_entity_type and entity_id = p_entity_id and status = 'open') then
+    raise exception 'ESCALATE_DUPLICATE: already escalated' using errcode = 'check_violation';
+  end if;
+
+  insert into public.case_escalations (entity_type, entity_id, reason, escalated_by)
+  values (p_entity_type, p_entity_id, btrim(p_reason), uid)
+  returning id into v_id;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'case.escalated', p_entity_type, p_entity_id, jsonb_build_object('escalation_id', v_id));  -- reason stays in the table
+
+  insert into public.notifications (user_id, type, title, message, payload)
+  select p.id, 'case_escalated', 'มีเรื่องส่งต่อให้ admin พิจารณา',
+         'เจ้าหน้าที่ส่งต่อเรื่อง 1 รายการให้ admin ตรวจสอบ',
+         jsonb_build_object('escalation_id', v_id)
+  from public.profiles p where p.role = 'admin' and p.id <> uid;
+
+  return v_id;
+end;
+$$;
+
+create or replace function public.resolve_escalation(p_id uuid, p_note text default null)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v public.case_escalations%rowtype;
+begin
+  if not public.is_admin() then
+    raise exception 'ESCALATE_FORBIDDEN: admin only' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v from public.case_escalations where id = p_id for update;
+  if not found or v.status <> 'open' then
+    raise exception 'ESCALATE_INVALID: not open' using errcode = 'check_violation';
+  end if;
+  if p_note is not null and char_length(p_note) > 1000 then
+    raise exception 'ESCALATE_INVALID: note too long' using errcode = 'check_violation';
+  end if;
+
+  update public.case_escalations
+  set status = 'resolved', resolved_by = uid, resolved_at = now(), resolution_note = nullif(btrim(coalesce(p_note, '')), '')
+  where id = p_id;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'case.escalation_resolved', v.entity_type, v.entity_id, jsonb_build_object('escalation_id', p_id));
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 4. Statistics (aggregates only)
+-- ---------------------------------------------------------
+create or replace function public.admin_stats(p_from date, p_to date)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+#variable_conflict use_column
+declare
+  v_from timestamptz := (p_from::text || ' 00:00:00+07')::timestamptz;
+  v_to   timestamptz := ((p_to + 1)::text || ' 00:00:00+07')::timestamptz;
+  v jsonb;
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'STATS_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_from is null or p_to is null or p_from > p_to or p_to - p_from > 731 then
+    raise exception 'STATS_INVALID: range' using errcode = 'check_violation';
+  end if;
+
+  with
+  s_lost as (select count(*) n from public.lost_items where created_at >= v_from and created_at < v_to),
+  s_found as (select count(*) n from public.found_items where created_at >= v_from and created_at < v_to),
+  s_match as (select count(*) n from public.matches where created_at >= v_from and created_at < v_to),
+  s_claims as (select count(*) n,
+               count(*) filter (where status = 'approved') approved,
+               count(*) filter (where status = 'rejected') rejected
+        from public.claims where created_at >= v_from and created_at < v_to),
+  s_ret as (select count(*) n,
+               avg(extract(epoch from (h.created_at - fi.created_at)) / 3600.0) avg_hours
+        from public.handovers h join public.found_items fi on fi.id = h.found_item_id
+        where h.created_at >= v_from and h.created_at < v_to),
+  -- success rate: of found items REPORTED in the range, how many are returned now
+  s_rate as (select count(*) total, count(*) filter (where status = 'returned') returned
+        from public.found_items where created_at >= v_from and created_at < v_to),
+  monthly as (
+    select to_char(date_trunc('month', d at time zone 'Asia/Bangkok'), 'YYYY-MM') ym,
+           count(*) filter (where kind = 'lost') n_lost,
+           count(*) filter (where kind = 'found') n_found,
+           count(*) filter (where kind = 'returned') n_returned
+    from (
+      select created_at d, 'lost' kind from public.lost_items where created_at >= v_from and created_at < v_to
+      union all select created_at, 'found' from public.found_items where created_at >= v_from and created_at < v_to
+      union all select created_at, 'returned' from public.handovers where created_at >= v_from and created_at < v_to
+    ) x group by 1 order by 1
+  )
+  select jsonb_build_object(
+    'lost_reports', (select n from s_lost),
+    'found_reports', (select n from s_found),
+    'matches', (select n from s_match),
+    'claims', (select n from s_claims),
+    'claims_approved', (select approved from s_claims),
+    'claims_rejected', (select rejected from s_claims),
+    'returns', (select n from s_ret),
+    'avg_return_hours', (select round(avg_hours::numeric, 1) from s_ret),
+    'found_in_range', (select total from s_rate),
+    'found_returned', (select returned from s_rate),
+    'return_success_rate', (select case when total = 0 then null else round(returned::numeric * 100 / total, 1) end from s_rate),
+    'monthly', coalesce((select jsonb_agg(jsonb_build_object('month', ym, 'lost', n_lost, 'found', n_found, 'returned', n_returned)) from monthly), '[]'::jsonb)
+  ) into v;
+  return v;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 5. Custody anomalies
+-- ---------------------------------------------------------
+create or replace function public.admin_custody_anomalies()
+returns table (kind text, found_item_id uuid, claim_id uuid, since timestamptz, detail text)
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+#variable_conflict use_column
+begin
+  if not public.is_staff_or_admin() then
+    raise exception 'STATS_FORBIDDEN: staff only' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  -- high-value item still with the finder > 2 days, any item > 7 days
+  select 'with_finder_too_long'::text, fi.id, null::uuid, fi.created_at,
+         case when coalesce(c.is_high_value, false) then 'ของมูลค่าสูงยังอยู่กับผู้พบเกิน 2 วัน' else 'ของยังอยู่กับผู้พบเกิน 7 วัน' end
+  from public.found_items fi left join public.categories c on c.id = fi.category_id
+  where fi.custody_status = 'with_finder'
+    and fi.status in ('reported', 'in_custody', 'matched', 'claim_pending', 'verified')
+    and fi.created_at < now() - case when coalesce(c.is_high_value, false) then interval '2 days' else interval '7 days' end
+  union all
+  -- finder says "handed to staff" but no staff has confirmed for > 3 days
+  select 'unconfirmed_transfer', fi.id, null, fi.created_at, 'ผู้พบแจ้งว่าส่งให้เจ้าหน้าที่แล้ว แต่ยังไม่มีเจ้าหน้าที่ยืนยันเกิน 3 วัน'
+  from public.found_items fi
+  where fi.custody_status = 'transferred_to_staff'
+    and not exists (select 1 from public.custody_history ch where ch.found_item_id = fi.id and ch.handled_by <> fi.finder_id)
+    and fi.created_at < now() - interval '3 days'
+  union all
+  -- approved but not picked up for > 7 days
+  select 'approved_not_collected', cl.found_item_id, cl.id, coalesce(cl.reviewed_at, cl.updated_at), 'อนุมัติแล้วแต่ยังไม่มารับเกิน 7 วัน'
+  from public.claims cl
+  where cl.status = 'approved'
+    and not exists (select 1 from public.handovers h where h.claim_id = cl.id)
+    and coalesce(cl.reviewed_at, cl.updated_at) < now() - interval '7 days'
+  union all
+  -- repeated wrong handover codes (possible guessing at the counter)
+  select 'handover_code_failures', cl.found_item_id, hc.claim_id, hc.created_at,
+         'กรอกรหัสรับของผิด ' || hc.failed_attempts || ' ครั้ง'
+  from public.handover_codes hc join public.claims cl on cl.id = hc.claim_id
+  where hc.failed_attempts >= 3 and hc.used_at is null
+  union all
+  -- inconsistent state
+  select 'state_mismatch', fi.id, null, fi.updated_at, 'สถานะรายการกับสถานะการครอบครองไม่สอดคล้องกัน'
+  from public.found_items fi
+  where (fi.status = 'returned') <> (fi.custody_status = 'released_to_owner')
+  order by 4;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 6. Privileges
+-- ---------------------------------------------------------
+revoke all on function public.escalate_case(text, uuid, text) from public, anon;
+revoke all on function public.resolve_escalation(uuid, text) from public, anon;
+revoke all on function public.admin_stats(date, date) from public, anon;
+revoke all on function public.admin_custody_anomalies() from public, anon;
+grant execute on function public.escalate_case(text, uuid, text) to authenticated;
+grant execute on function public.resolve_escalation(uuid, text) to authenticated;
+grant execute on function public.admin_stats(date, date) to authenticated;
+grant execute on function public.admin_custody_anomalies() to authenticated;
+
+-- ---------- migrations/0026_phase11_security_hardening.sql ----------
+-- =========================================================
+-- 0026_phase11_security_hardening.sql
+-- Phase 11 — Security Testing: fixes for issues found during the audit.
+--
+--   1. Forced password change was only enforced by Next.js middleware.
+--      * A user could PATCH profiles.must_change_password=false through the
+--        REST API without ever changing the password (0017 allowed the
+--        owner to clear it unconditionally).
+--      * While the flag was set, is_admin()/is_staff_or_admin() still
+--        returned true, so the seeded admin (admin12345) had full admin
+--        power via the API before changing the password.
+--      Fix: clearing the flag now requires that auth.users.encrypted_password
+--      actually changed since the flag was set (marker table), and the role
+--      helpers return false while the flag is set or the account is
+--      restricted.
+--   2. A finder could edit secret_details / serial_number / exact_location /
+--      exact_time / private image / category of a found item after someone
+--      had already claimed it (collusion: copy the claimant's answers into
+--      the secret, or sabotage the real owner). Now locked for non-staff
+--      once any claim exists.
+--   3. Users could change their own profiles.email / user_type (which staff
+--      rely on when reviewing claims). Now admin-only; full_name / phone get
+--      length limits.
+--   4. Privilege cleanup: anon could SELECT the profiles table (RLS returned
+--      nothing, but there is no reason to expose it) and EXECUTE several
+--      helper functions (assert_max_len, is_own_storage_object,
+--      current_user_role, ...). Only is_admin()/is_staff_or_admin() stay
+--      executable by anon because RLS policies evaluated for anon call them.
+--
+-- Idempotent — safe to run more than once.
+-- =========================================================
+
+-- ---------------------------------------------------------
+-- 1a. Role helpers: no staff/admin power while a password change is
+--     pending or the account is restricted.
+-- ---------------------------------------------------------
+create or replace function public.current_user_role()
+returns public.system_role_enum
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select case
+           when p.must_change_password or p.is_restricted then 'user'::public.system_role_enum
+           else p.role
+         end
+  from public.profiles p
+  where p.id = auth.uid();
+$$;
+
+create or replace function public.is_admin()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select coalesce((
+    select p.role = 'admin' and not p.must_change_password and not p.is_restricted
+    from public.profiles p where p.id = auth.uid()
+  ), false);
+$$;
+
+create or replace function public.is_staff_or_admin()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select coalesce((
+    select p.role in ('staff', 'admin') and not p.must_change_password and not p.is_restricted
+    from public.profiles p where p.id = auth.uid()
+  ), false);
+$$;
+
+-- ---------------------------------------------------------
+-- 1b. Password-change marker: remember the password hash at the moment
+--     must_change_password became true. Not reachable through the API.
+-- ---------------------------------------------------------
+create table if not exists public.password_change_markers (
+  user_id     uuid primary key references public.profiles(id) on delete cascade,
+  hash_at_set text,
+  set_at      timestamptz not null default now()
+);
+alter table public.password_change_markers enable row level security;
+revoke all on public.password_change_markers from anon, authenticated;
+
+create or replace function public.guard_must_change_password()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_current text;
+  v_marker  public.password_change_markers%rowtype;
+begin
+  if new.must_change_password
+     and (tg_op = 'INSERT' or not old.must_change_password) then
+    select u.encrypted_password into v_current from auth.users u where u.id = new.id;
+    insert into public.password_change_markers (user_id, hash_at_set, set_at)
+    values (new.id, v_current, now())
+    on conflict (user_id) do update set hash_at_set = excluded.hash_at_set, set_at = now();
+    return new;
+  end if;
+
+  if tg_op = 'UPDATE' and old.must_change_password and not new.must_change_password then
+    -- Service role / SQL editor (no JWT) and a real admin acting on
+    -- someone else may clear it. The owner may only clear it after the
+    -- password really changed.
+    if uid is null or (public.is_admin() and new.id <> uid) then
+      delete from public.password_change_markers where user_id = new.id;
+      return new;
+    end if;
+
+    select u.encrypted_password into v_current from auth.users u where u.id = new.id;
+    select * into v_marker from public.password_change_markers where user_id = new.id;
+    if not found or v_current is null
+       or v_current is not distinct from v_marker.hash_at_set then
+      raise exception 'PASSWORD_CHANGE_REQUIRED: change your password first'
+        using errcode = 'insufficient_privilege';
+    end if;
+    delete from public.password_change_markers where user_id = new.id;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_profiles_guard_must_change_password on public.profiles;
+create trigger trg_profiles_guard_must_change_password
+  before insert or update on public.profiles
+  for each row execute function public.guard_must_change_password();
+
+-- Backfill markers for accounts that are already waiting for a change
+-- (e.g. the seeded admin created before this migration).
+insert into public.password_change_markers (user_id, hash_at_set)
+select p.id, u.encrypted_password
+from public.profiles p
+join auth.users u on u.id = p.id
+where p.must_change_password
+on conflict (user_id) do nothing;
+
+-- ---------------------------------------------------------
+-- 1c. Server-side contexts (service role key, SQL editor: no JWT user)
+--     may manage roles/flags. Before this, scripts/create-admin.ts and a
+--     manual "update profiles set role='admin'" in the SQL editor both
+--     failed with "Only admins can change role", because is_admin() is
+--     false when there is no auth.uid(). anon cannot reach these paths
+--     (no UPDATE grant / RLS requires id = auth.uid()).
+-- ---------------------------------------------------------
+create or replace function public.prevent_self_role_escalation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is not null and not public.is_admin() then
+    if new.role is distinct from old.role then
+      raise exception 'Only admins can change role';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create or replace function public.protect_profile_sensitive_fields()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is not null and not public.is_admin() then
+    if new.is_restricted is distinct from old.is_restricted then
+      raise exception 'Only admins can change is_restricted';
+    end if;
+    -- Owner may only clear it (true -> false); guard_must_change_password
+    -- additionally requires that the password really changed.
+    if new.must_change_password is distinct from old.must_change_password then
+      if new.id <> auth.uid() then
+        raise exception 'Only admins can change another user''s must_change_password';
+      end if;
+      if new.must_change_password is true then
+        raise exception 'Users cannot set must_change_password back to true';
+      end if;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+-- ---------------------------------------------------------
+-- 3. Profile fields: email / user_type are admin-only; length limits.
+-- ---------------------------------------------------------
+create or replace function public.guard_profile_identity_fields()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is not null and not public.is_admin() then
+    if new.email is distinct from old.email
+       or new.user_type is distinct from old.user_type
+       or new.id is distinct from old.id
+       or new.created_at is distinct from old.created_at then
+      raise exception 'PROFILE_FORBIDDEN: only admins can change email or user type'
+        using errcode = 'insufficient_privilege';
+    end if;
+  end if;
+  if char_length(btrim(coalesce(new.full_name, ''))) = 0 or char_length(new.full_name) > 120 then
+    raise exception 'PROFILE_INVALID: full_name' using errcode = 'check_violation';
+  end if;
+  if new.phone is not null and char_length(new.phone) > 30 then
+    raise exception 'PROFILE_INVALID: phone' using errcode = 'check_violation';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_profiles_guard_identity on public.profiles;
+create trigger trg_profiles_guard_identity
+  before update on public.profiles
+  for each row execute function public.guard_profile_identity_fields();
+
+-- ---------------------------------------------------------
+-- 2. Lock a found item's verification data once anyone has claimed it.
+-- ---------------------------------------------------------
+create or replace function public.guard_found_item_secret_lock()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null or public.is_staff_or_admin() then
+    return new;
+  end if;
+  if (new.secret_details    is distinct from old.secret_details
+      or new.serial_number  is distinct from old.serial_number
+      or new.exact_location is distinct from old.exact_location
+      or new.exact_time     is distinct from old.exact_time
+      or new.private_image_url is distinct from old.private_image_url
+      or new.category_id    is distinct from old.category_id)
+     and exists (select 1 from public.claims c where c.found_item_id = old.id) then
+    raise exception 'REPORT_LOCKED: verification details cannot change after a claim was made'
+      using errcode = 'insufficient_privilege';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_found_items_secret_lock on public.found_items;
+create trigger trg_found_items_secret_lock
+  before update on public.found_items
+  for each row execute function public.guard_found_item_secret_lock();
+
+-- ---------------------------------------------------------
+-- 4. Privilege cleanup
+-- ---------------------------------------------------------
+revoke all on public.profiles from anon;
+revoke insert, delete, truncate on public.profiles from authenticated;
+-- matches / notifications are written only by the service role (matching job,
+-- notification writer) and SECURITY DEFINER functions; users just read
+-- (and mark notifications read via the is_read column grant from 0020).
+revoke insert, update, delete on public.matches from authenticated;
+revoke insert, delete on public.notifications from authenticated;
+
+-- Supabase grants every privilege on new tables to anon/authenticated.
+-- TRUNCATE / REFERENCES / TRIGGER are never needed by API users (and
+-- TRUNCATE is not subject to RLS), views are read-only, and anon never
+-- writes anything.
+do $$
+declare t record;
+begin
+  for t in
+    select c.oid::regclass as rel, c.relkind
+    from pg_class c join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public' and c.relkind in ('r', 'v', 'm', 'p')
+  loop
+    execute format('revoke truncate, references, trigger on %s from anon, authenticated', t.rel);
+    execute format('revoke insert, update, delete on %s from anon', t.rel);
+    if t.relkind in ('v', 'm') then
+      execute format('revoke insert, update, delete on %s from authenticated', t.rel);
+    end if;
+  end loop;
+end $$;
+
+-- Functions: anon may execute only the two role helpers used inside RLS
+-- policies. Keep authenticated's existing access explicit (it may have come
+-- through PUBLIC) before revoking PUBLIC.
+do $$
+declare
+  f record;
+begin
+  for f in
+    select p.oid, p.oid::regprocedure as sig, p.proname
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public'
+      and p.prokind = 'f'
+      and p.prorettype <> 'trigger'::regtype
+      and not exists (select 1 from pg_depend d
+                      where d.objid = p.oid and d.deptype = 'e')   -- skip extension members
+  loop
+    if f.proname in ('is_admin', 'is_staff_or_admin') then
+      execute format('grant execute on function %s to anon, authenticated', f.sig);
+      continue;
+    end if;
+    if has_function_privilege('authenticated', f.oid, 'execute') then
+      execute format('grant execute on function %s to authenticated', f.sig);
+    end if;
+    execute format('revoke execute on function %s from public, anon', f.sig);
+  end loop;
+end $$;
+
+-- Pure internal helpers used only inside SECURITY DEFINER code.
+revoke execute on function public.assert_max_len(text, int, text) from authenticated;
+revoke execute on function public.try_uuid(text) from authenticated;
+revoke execute on function public.raise_risk_event(text, public.risk_level_enum, uuid, uuid, uuid, jsonb) from authenticated;
+revoke execute on function public.contradicted_answer_keys(jsonb, jsonb) from authenticated;
+
+-- New functions added later must repeat this pattern (revoke from public,
+-- anon; grant to authenticated). supabase/tests/phase11_security.test.sql
+-- fails if any other public function is executable by anon.
+
+-- ---------- migrations/0027_phase12_user_roles.sql ----------
+-- =========================================================
+-- 0027_phase12_user_roles.sql
+-- Phase 12 — Production readiness: appoint / remove staff from the app.
+--
+-- Until now the only way to make someone staff was an UPDATE in the SQL
+-- editor. set_user_role() gives admins a safe, audited way:
+--   * admin only (is_admin(): not while a password change is pending)
+--   * cannot change your own role (no accidental self-demotion)
+--   * cannot remove the last active admin
+--   * reason required; audit_logs gets profile.role_changed (0024 trigger)
+--     plus a 'user.role_set' entry with the reason
+--   * the user gets a neutral notification
+-- Idempotent.
+-- =========================================================
+
+create or replace function public.set_user_role(p_user_id uuid, p_role public.system_role_enum, p_reason text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid uuid := auth.uid();
+  v_old public.system_role_enum;
+begin
+  if not public.is_admin() then
+    raise exception 'ROLE_FORBIDDEN: admin only' using errcode = 'insufficient_privilege';
+  end if;
+  if p_user_id = uid then
+    raise exception 'ROLE_FORBIDDEN: cannot change your own role' using errcode = 'insufficient_privilege';
+  end if;
+  if p_reason is null or char_length(btrim(p_reason)) < 3 or char_length(p_reason) > 500 then
+    raise exception 'ROLE_INVALID: reason required (3-500 characters)' using errcode = 'check_violation';
+  end if;
+
+  select role into v_old from public.profiles where id = p_user_id for update;
+  if not found then
+    raise exception 'ROLE_INVALID: user not found' using errcode = 'check_violation';
+  end if;
+  if v_old = p_role then
+    return;
+  end if;
+  if v_old = 'admin' and (select count(*) from public.profiles
+                          where role = 'admin' and not is_restricted and id <> p_user_id) = 0 then
+    raise exception 'ROLE_FORBIDDEN: cannot remove the last admin' using errcode = 'check_violation';
+  end if;
+
+  update public.profiles set role = p_role where id = p_user_id;
+
+  insert into public.audit_logs (actor_id, action, entity_type, entity_id, metadata)
+  values (uid, 'user.role_set', 'user', p_user_id,
+          jsonb_build_object('from', v_old, 'to', p_role, 'reason', btrim(p_reason)));
+
+  insert into public.notifications (user_id, type, title, message, payload)
+  values (p_user_id, 'role_changed', 'สิทธิ์การใช้งานของคุณเปลี่ยนแปลง',
+          case p_role when 'user' then 'บัญชีของคุณกลับเป็นผู้ใช้ทั่วไป'
+                      when 'staff' then 'บัญชีของคุณได้รับสิทธิ์เจ้าหน้าที่'
+                      else 'บัญชีของคุณได้รับสิทธิ์ผู้ดูแลระบบ' end,
+          '{}'::jsonb);
+end;
+$$;
+
+revoke all on function public.set_user_role(uuid, public.system_role_enum, text) from public, anon;
+grant execute on function public.set_user_role(uuid, public.system_role_enum, text) to authenticated;
+
+create index if not exists profiles_role_idx on public.profiles (role) where role <> 'user';
+create index if not exists profiles_email_lower_idx on public.profiles (lower(email));

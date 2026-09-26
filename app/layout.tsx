@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Nav } from "@/components/nav";
 import { getCurrentProfile } from "@/lib/auth/session";
+import { createClient } from "@/lib/supabase/server";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -17,10 +18,21 @@ export default async function RootLayout({
   // itself safe to render on public routes without forcing a login.
   const profile = await getCurrentProfile();
 
+  let unreadCount = 0;
+  if (profile) {
+    const supabase = await createClient();
+    const { count } = await supabase
+      .from("notifications")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", profile.id)
+      .eq("is_read", false);
+    unreadCount = count ?? 0;
+  }
+
   return (
     <html lang="th">
       <body className="min-h-screen bg-cdti-50 text-gray-900 antialiased">
-        <Nav profile={profile} />
+        <Nav profile={profile} unreadCount={unreadCount} />
         <main className="mx-auto max-w-5xl px-4 py-8">{children}</main>
       </body>
     </html>

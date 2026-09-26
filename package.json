@@ -1,6 +1,6 @@
 {
   "name": "cdti-smart-lost-found",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -8,7 +8,14 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "create-admin": "tsx scripts/create-admin.ts"
+    "create-admin": "tsx scripts/create-admin.ts",
+    "test": "tsx --test src/lib/reports/validation.test.ts src/lib/listing/search.test.ts src/lib/matching/score.test.ts src/lib/claims/claims.test.ts src/lib/risk/risk.test.ts src/lib/handover/handover.test.ts src/lib/audit/audit.test.ts src/lib/auth/routes.test.ts src/lib/auth/redirect.test.ts",
+    "rematch": "tsx scripts/rematch-all.ts",
+    "security:bundle": "node scripts/security/check-bundle.mjs",
+    "prebuild": "node scripts/check-env.mjs",
+    "check:env": "node scripts/check-env.mjs --strict",
+    "security:secrets": "node scripts/security/check-secrets.mjs",
+    "smoke:prod": "node scripts/smoke-prod.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.5",
@@ -30,5 +37,8 @@
     "tailwindcss": "^3.4.4",
     "tsx": "^4.16.2",
     "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=18.18"
   }
 }

@@ -59,15 +59,17 @@
 
 **เป้าหมาย:** ฟอร์มแจ้งของหาย/พบของ พร้อมแยก public/private field
 
-- [ ] Report Lost Form (item name, category, brand, color, date, location, description, image, **private ownership details**)
-- [ ] Report Found Form (category, general name, color, date, general location, description, public image)
-  - [ ] เพิ่ม field private: exact location, exact time, serial number, secret_details, custody_status
-- [ ] ถามสถานะ custody ทันทีตอน report found
-- [ ] คำแนะนำ UI: ของมูลค่าสูงควรนำส่งจุดรับของกลาง
-- [ ] คำเตือนเรื่องภาพ: หลีกเลี่ยงถ่ายข้อมูลส่วนบุคคลให้เห็นชัด
-- [ ] แยก `public_image_url` / `private_image_url`
+- [x] Report Lost Form (item name, category, brand, color, date, location, description, image, **private ownership details**)
+- [x] Report Found Form (category, general name, color, date, general location, description, public image)
+  - [x] เพิ่ม field private: exact location, exact time, serial number, secret_details, custody_status
+- [x] ถามสถานะ custody ทันทีตอน report found
+- [x] คำแนะนำ UI: ของมูลค่าสูงควรนำส่งจุดรับของกลาง
+- [x] คำเตือนเรื่องภาพ: หลีกเลี่ยงถ่ายข้อมูลส่วนบุคคลให้เห็นชัด
+- [x] แยก `public_image_url` / `private_image_url`
 
 **Deliverable:** ผู้ใช้ report ของหาย/พบได้ ข้อมูลถูกแยกชั้นความลับถูกต้อง
+
+รายละเอียด: [`docs/PHASE_3_README.md`](docs/PHASE_3_README.md)
 
 ---
 
@@ -75,11 +77,13 @@
 
 **เป้าหมาย:** หน้าค้นหา/ประกาศสาธารณะที่ไม่รั่วข้อมูล verification
 
-- [ ] หน้า Public Found Listing (ประเภท, สีคร่าว ๆ, วันที่, พื้นที่คร่าว ๆ)
-- [ ] Search ด้วย field สาธารณะเท่านั้น (item type, category, general color, general location, date range)
-- [ ] ทดสอบว่า secret_details / serial / finder identity ไม่ปรากฏใน response ใด ๆ
+- [x] หน้า Public Found Listing (ประเภท, สีคร่าว ๆ, วันที่, พื้นที่คร่าว ๆ)
+- [x] Search ด้วย field สาธารณะเท่านั้น (item type, category, general color, general location, date range)
+- [x] ทดสอบว่า secret_details / serial / finder identity ไม่ปรากฏใน response ใด ๆ
 
 **Deliverable:** Public สามารถ browse/search ได้โดยไม่เห็นข้อมูล verification
+
+รายละเอียด: [`docs/PHASE_4_README.md`](docs/PHASE_4_README.md)
 
 ---
 
@@ -87,13 +91,15 @@
 
 **เป้าหมาย:** ระบบแนะนำรายการที่อาจตรงกันระหว่าง Lost/Found
 
-- [ ] คำนวณ Match Score (เต็ม 100):
+- [x] คำนวณ Match Score (เต็ม 100):
   Category 30 / Color 15 / Brand 15 / Location 20 / Date 10 / Description Keyword 10
-- [ ] แสดงผลเป็น "ความเป็นไปได้ที่รายการตรงกัน" เท่านั้น (ห้ามสื่อว่าเป็นเจ้าของ)
-- [ ] ตาราง `matches` เก็บผลการจับคู่
-- [ ] Notification เมื่อพบ Potential Match
+- [x] แสดงผลเป็น "ความเป็นไปได้ที่รายการตรงกัน" เท่านั้น (ห้ามสื่อว่าเป็นเจ้าของ)
+- [x] ตาราง `matches` เก็บผลการจับคู่
+- [x] Notification เมื่อพบ Potential Match
 
 **Deliverable:** ระบบแนะนำ Potential Match อัตโนมัติ
+
+รายละเอียด: [`docs/PHASE_5_README.md`](docs/PHASE_5_README.md)
 
 ---
 
@@ -101,16 +107,18 @@
 
 **เป้าหมาย:** กระบวนการยืนยันความเป็นเจ้าของอย่างปลอดภัย
 
-- [ ] ปุ่ม "ฉันคิดว่านี่อาจเป็นของฉัน" → สร้าง Claim
-- [ ] Claim Questionnaire ปรับตาม category (general / wallet / key / electronics)
-  - [ ] ห้ามถาม password, PIN, credential
-- [ ] Claim Evidence upload (private, ห้าม public เห็น)
-- [ ] Verification Checklist → ผลลัพธ์: insufficient / needs_review / likely_owner / verified
-- [ ] Anti-guessing: reject message เป็นข้อความกลาง ๆ ไม่บอกว่าตอบข้อไหนผิด
-- [ ] Claim rate limit + cooldown (`claim_attempt_count`)
-- [ ] Verification Level: standard / enhanced (สำหรับของมูลค่าสูง)
+- [x] ปุ่ม "ฉันคิดว่านี่อาจเป็นของฉัน" → สร้าง Claim
+- [x] Claim Questionnaire ปรับตาม category (general / wallet / key / electronics)
+  - [x] ห้ามถาม password, PIN, credential
+- [x] Claim Evidence upload (private, ห้าม public เห็น)
+- [x] Verification Checklist → ผลลัพธ์: insufficient / needs_review / likely_owner / verified
+- [x] Anti-guessing: reject message เป็นข้อความกลาง ๆ ไม่บอกว่าตอบข้อไหนผิด
+- [x] Claim rate limit + cooldown (`claim_attempt_count`)
+- [x] Verification Level: standard / enhanced (สำหรับของมูลค่าสูง)
 
 **Deliverable:** Flow Claim → Verification ทำงานครบ ปลอดภัยจากการเดา
+
+รายละเอียด: [`docs/PHASE_6_README.md`](docs/PHASE_6_README.md)
 
 ---
 
@@ -118,12 +126,14 @@
 
 **เป้าหมาย:** ตรวจจับพฤติกรรมเสี่ยงและจัดการข้อพิพาท
 
-- [ ] ตาราง `risk_events` (event_type, risk_level, related_item/claim, resolution)
-- [ ] Risk signals: claim ถี่, reject บ่อย, claim ซ้ำ item เดิม, เปลี่ยนคำตอบหลายครั้ง, account ใหม่ claim ของมูลค่าสูง
-- [ ] ใช้สถานะกลาง (Needs Review, Suspicious Activity) ห้ามระบุว่าเป็น "โจร"
-- [ ] Dispute handling: มากกว่า 1 claim ต่อ item → สถานะ `disputed` → ระงับ handover → ส่ง Staff/Admin review
+- [x] ตาราง `risk_events` (event_type, risk_level, related_item/claim, resolution)
+- [x] Risk signals: claim ถี่, reject บ่อย, claim ซ้ำ item เดิม, เปลี่ยนคำตอบหลายครั้ง, account ใหม่ claim ของมูลค่าสูง
+- [x] ใช้สถานะกลาง (Needs Review, Suspicious Activity) ห้ามระบุว่าเป็น "โจร"
+- [x] Dispute handling: มากกว่า 1 claim ต่อ item → สถานะ `disputed` → ระงับ handover → ส่ง Staff/Admin review
 
 **Deliverable:** ระบบ flag ความเสี่ยงและ dispute ให้ Admin ตรวจสอบได้
+
+รายละเอียด: [`docs/PHASE_7_README.md`](docs/PHASE_7_README.md)
 
 ---
 
@@ -131,14 +141,16 @@
 
 **เป้าหมาย:** ควบคุมกระบวนการส่งมอบของคืนอย่างปลอดภัย
 
-- [ ] ตาราง `custody_history` (from_status → to_status, handled_by, location, timestamp)
-- [ ] แยกบทบาทชัดเจน: ผู้แจ้งพบของ / ผู้ครอบครองปัจจุบัน / เจ้าหน้าที่ / ผู้ claim / ผู้ verify / ผู้รับของจริง
-- [ ] One-Time Handover Code (6 หลัก, มี expiration, hash เก็บ, ใช้ได้ครั้งเดียว)
-- [ ] Handover Confirmation: บันทึก claim, item, handed_over_by, received_by, location, timestamp
-- [ ] Enhanced Verification item ต้องมี Staff/Admin ยืนยันก่อน handover
-- [ ] จัดการ `handover_locations` (Admin เพิ่ม/แก้ได้ ไม่ hardcode)
+- [x] ตาราง `custody_history` (from_status → to_status, handled_by, location, timestamp)
+- [x] แยกบทบาทชัดเจน: ผู้แจ้งพบของ / ผู้ครอบครองปัจจุบัน / เจ้าหน้าที่ / ผู้ claim / ผู้ verify / ผู้รับของจริง
+- [x] One-Time Handover Code (6 หลัก, มี expiration, hash เก็บ, ใช้ได้ครั้งเดียว)
+- [x] Handover Confirmation: บันทึก claim, item, handed_over_by, received_by, location, timestamp
+- [x] Enhanced Verification item ต้องมี Staff/Admin ยืนยันก่อน handover
+- [x] จัดการ `handover_locations` (Admin เพิ่ม/แก้ได้ ไม่ hardcode)
 
 **Deliverable:** กระบวนการส่งมอบของคืนที่ตรวจสอบย้อนหลังได้ ป้องกันการแอบอ้าง
+
+รายละเอียด: [`docs/PHASE_8_README.md`](docs/PHASE_8_README.md)
 
 ---
 
@@ -146,13 +158,15 @@
 
 **เป้าหมาย:** แจ้งเตือนผู้ใช้และเก็บประวัติการดำเนินการ
 
-- [ ] Notifications: potential match, claim received, ต้องการข้อมูลเพิ่ม, approved/rejected, handover ready/completed, admin review required
-  - [ ] ห้าม notification เปิดเผย secret_details
-- [ ] ตาราง `audit_logs` (actor, action, entity_type, entity_id, metadata, created_at)
-  - [ ] เก็บทุก event สำคัญ: item created/edited, claim submitted/reviewed/approved/rejected, risk flag, custody changed, handover initiated/completed, admin action
-  - [ ] User ปกติแก้ audit log ไม่ได้
+- [x] Notifications: potential match, claim received, ต้องการข้อมูลเพิ่ม, approved/rejected, handover ready/completed, admin review required
+  - [x] ห้าม notification เปิดเผย secret_details
+- [x] ตาราง `audit_logs` (actor, action, entity_type, entity_id, metadata, created_at)
+  - [x] เก็บทุก event สำคัญ: item created/edited, claim submitted/reviewed/approved/rejected, risk flag, custody changed, handover initiated/completed, admin action
+  - [x] User ปกติแก้ audit log ไม่ได้
 
 **Deliverable:** ระบบแจ้งเตือนครบ + audit trail ตรวจสอบย้อนหลังได้
+
+รายละเอียด: [`docs/PHASE_9_README.md`](docs/PHASE_9_README.md)
 
 ---
 
@@ -160,15 +174,17 @@
 
 **เป้าหมาย:** เครื่องมือให้ Admin ควบคุมและตรวจสอบระบบทั้งหมด
 
-- [ ] Dashboard "รายการต้องตรวจสอบ": high-risk claims, repeated rejections, high-value items, disputes, suspicious activity, custody anomalies
-- [ ] จัดการ Categories / Locations / Handover Locations
-- [ ] ตรวจสอบ Claims, Disputes, Risk Events, Custody History, Audit Logs
-- [ ] Internal Notes (staff/admin only)
-- [ ] Approve / Reject Claim, Restrict Account, Escalate Case
-- [ ] Statistics: lost/found reports, matches, claims, successful returns, rejected claims, avg return time, return success rate (ไม่เปิด risk statistics รายบุคคลต่อ public)
-- [ ] Route `/admin` ป้องกันด้วย role check ทั้ง server-side และ RLS (ไม่ใช่แค่ซ่อนเมนู)
+- [x] Dashboard "รายการต้องตรวจสอบ": high-risk claims, repeated rejections, high-value items, disputes, suspicious activity, custody anomalies
+- [x] จัดการ Categories / Locations / Handover Locations
+- [x] ตรวจสอบ Claims, Disputes, Risk Events, Custody History, Audit Logs
+- [x] Internal Notes (staff/admin only)
+- [x] Approve / Reject Claim, Restrict Account, Escalate Case
+- [x] Statistics: lost/found reports, matches, claims, successful returns, rejected claims, avg return time, return success rate (ไม่เปิด risk statistics รายบุคคลต่อ public)
+- [x] Route `/admin` ป้องกันด้วย role check ทั้ง server-side และ RLS (ไม่ใช่แค่ซ่อนเมนู)
 
 **Deliverable:** Admin ควบคุมและตรวจสอบระบบได้ครบวงจร
+
+รายละเอียด: [`docs/PHASE_10_README.md`](docs/PHASE_10_README.md)
 
 ---
 
@@ -177,20 +193,20 @@
 **เป้าหมาย:** ยืนยันว่าระบบปลอดภัยจริงในทุกจุด
 
 Test cases ขั้นต่ำ:
-- [ ] User A อ่าน secret ของ User B ไม่ได้
-- [ ] Claimant อ่าน secret_detail ไม่ได้
-- [ ] Public อ่าน evidence ไม่ได้
-- [ ] User แก้ item คนอื่นไม่ได้
-- [ ] User เข้า Admin ไม่ได้ / เปลี่ยน role ไม่ได้
-- [ ] Rejected claimant ไม่ได้รับ hint คำตอบ
-- [ ] Duplicate claim ถูกควบคุมด้วย rate limit
-- [ ] Multiple claim เกิด dispute ถูกต้อง
-- [ ] Handover code ใช้ซ้ำไม่ได้
-- [ ] Audit log ถูกสร้างครบ
-- [ ] Returned item claim ใหม่ไม่ได้
-- [ ] ตรวจ: Authentication, Authorization, RLS, Storage Policies, Input/File Validation, Rate Limiting, Service Role Key ไม่หลุดไป Browser
+- [x] User A อ่าน secret ของ User B ไม่ได้
+- [x] Claimant อ่าน secret_detail ไม่ได้
+- [x] Public อ่าน evidence ไม่ได้
+- [x] User แก้ item คนอื่นไม่ได้
+- [x] User เข้า Admin ไม่ได้ / เปลี่ยน role ไม่ได้
+- [x] Rejected claimant ไม่ได้รับ hint คำตอบ
+- [x] Duplicate claim ถูกควบคุมด้วย rate limit
+- [x] Multiple claim เกิด dispute ถูกต้อง
+- [x] Handover code ใช้ซ้ำไม่ได้
+- [x] Audit log ถูกสร้างครบ
+- [x] Returned item claim ใหม่ไม่ได้
+- [x] ตรวจ: Authentication, Authorization, RLS, Storage Policies, Input/File Validation, Rate Limiting, Service Role Key ไม่หลุดไป Browser
 
-**Deliverable:** ผ่านการทดสอบความปลอดภัยทุกกรณี
+**Deliverable:** ผ่านการทดสอบความปลอดภัยทุกกรณี — ดู `docs/PHASE_11_README.md` (ชุดทดสอบ `supabase/tests/phase11_security.test.sql`, self-test `supabase/verify/security_selftest.sql`, `npm run security:bundle`)
 
 ---
 
@@ -198,17 +214,19 @@ Test cases ขั้นต่ำ:
 
 **เป้าหมาย:** เตรียมระบบให้พร้อมใช้งานจริง
 
-- [ ] Deploy บน Vercel
-- [ ] ตรวจ Core Flow ครบวงจรอีกครั้ง:
+> เครื่องมือและเอกสารพร้อมแล้ว (ดู `docs/PHASE_12_README.md`) — ข้อที่ยังไม่ติ๊กต้องทำด้วยบัญชี/ข้อมูลจริงของสถาบัน ตาม `docs/DEPLOYMENT.md`
+
+- [ ] Deploy บน Vercel — `docs/DEPLOYMENT.md` ข้อ 6 แล้วรัน `npm run smoke:prod -- <url>`
+- [ ] ตรวจ Core Flow ครบวงจรอีกครั้ง (อัตโนมัติผ่านแล้ว: `supabase/tests/phase12_core_flow.test.sql` · ด้วยมือบน staging: `docs/PHASE_12_README.md`):
   - Lost → Match → Claim → Verification → Review → Secure Handover → Returned
   - Found → Custody → Match → Claim → Verification → Handover → Returned
-- [ ] เปลี่ยนรหัสผ่าน Admin เริ่มต้น (`admin12345`) เป็นรหัสที่รัดกุม
-- [ ] เปิด Email Verification ตามความเหมาะสม
-- [ ] ตรวจสอบ RLS ครั้งสุดท้ายทุกตาราง
-- [ ] ตรวจว่าไม่มี password/secret หลุดใน Git repository
-- [ ] ห้ามมี Demo Account / Fake Seed Data / Fake Claims ใน Production DB
-  - Seed ได้เฉพาะ: categories, system configuration, location ที่ยืนยันแล้ว
-- [ ] เอกสารส่งมอบระบบ + คู่มือ Admin
+- [ ] เปลี่ยนรหัสผ่าน Admin เริ่มต้น (`admin12345`) เป็นรหัสที่รัดกุม — `create-admin` ไม่รับ `admin12345` แล้ว และฐานข้อมูลบังคับเปลี่ยนก่อนได้สิทธิ์ admin
+- [ ] เปิด Email Verification ตามความเหมาะสม — ต้องตั้ง SMTP ก่อน (`docs/DEPLOYMENT.md` ข้อ 3)
+- [ ] ตรวจสอบ RLS ครั้งสุดท้ายทุกตาราง — `supabase/verify/production_readiness.sql` + `security_selftest.sql`
+- [ ] ตรวจว่าไม่มี password/secret หลุดใน Git repository — `npm run security:secrets`
+- [ ] ห้ามมี Demo Account / Fake Seed Data / Fake Claims ใน Production DB — ใช้ Supabase project ใหม่ + `production_readiness.sql`
+  - Seed ได้เฉพาะ: categories, system configuration, location ที่ยืนยันแล้ว (`supabase/seed/locations_template.sql`)
+- [x] เอกสารส่งมอบระบบ + คู่มือ Admin — `docs/HANDOVER.md`, `docs/ADMIN_GUIDE.md`, `docs/DEPLOYMENT.md`
 
 **Deliverable:** ระบบพร้อมใช้งานจริง ปลอดภัย ตรวจสอบย้อนหลังได้
 

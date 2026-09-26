@@ -2,6 +2,7 @@ import "server-only";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import type { Profile } from "@/types/database.types";
+import { hasAdminAccess, hasStaffAccess } from "./routes";
 
 /**
  * Returns the current user's profile, or null if logged out.
@@ -47,16 +48,18 @@ export async function requireProfile(): Promise<Profile> {
  */
 export async function requireStaffOrAdmin(): Promise<Profile> {
   const profile = await requireProfile();
-  if (profile.role !== "staff" && profile.role !== "admin") {
-    redirect("/dashboard");
+  // Same rule as public.is_staff_or_admin() (0026): pending password change
+  // or a restricted account means no staff access.
+  if (!hasStaffAccess(profile)) {
+    redirect(profile.must_change_password ? "/change-password" : "/dashboard");
   }
   return profile;
 }
 
 export async function requireAdmin(): Promise<Profile> {
   const profile = await requireProfile();
-  if (profile.role !== "admin") {
-    redirect("/dashboard");
+  if (!hasAdminAccess(profile)) {
+    redirect(profile.must_change_password ? "/change-password" : "/dashboard");
   }
   return profile;
 }

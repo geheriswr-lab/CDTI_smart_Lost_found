@@ -25,7 +25,13 @@ export default async function LoginPage({
 
       <LoginForm next={params.next} />
 
-      <p className="mt-4 text-sm text-gray-500">
+      <p className="mt-3 text-right text-sm">
+        <Link href="/forgot-password" className="text-cdti-600 hover:underline">
+          ลืมรหัสผ่าน?
+        </Link>
+      </p>
+
+      <p className="mt-2 text-sm text-gray-500">
         ยังไม่มีบัญชี?{" "}
         <Link href="/signup" className="text-cdti-600 hover:underline">
           สมัครสมาชิก
